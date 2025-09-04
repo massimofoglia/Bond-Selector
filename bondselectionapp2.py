@@ -468,10 +468,3 @@ if st.button("Costruisci portafoglio"):
     st.balloons()
 
 # End of file
-
-# =============================
-# requirements.txt content (place in a separate file when deploying)
-# =============================
-# streamlit>=1.35
-# pandas>=2.2
-# numpy>=1.26
