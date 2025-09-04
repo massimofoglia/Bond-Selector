@@ -19,20 +19,18 @@ The app implements the business rules you specified:
   weighted targets across Currency, IssuerType, Sector, and Maturity buckets.
 """
 
-from __future__ import annotations
 import io
-import json
 import math
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 
 # =============================
-# Data Loading & Preparation
+# Utility / schema handling
 # =============================
 
 REQUIRED_COLS_ALIASES = {
@@ -40,7 +38,6 @@ REQUIRED_COLS_ALIASES = {
     "ISIN": ["ISIN", "ISIN Code"],
     "Issuer": ["Issuer", "Issuer Name"],
     "Maturity": ["Maturity", "Maturity Date"],
-    "Coupon": ["Coupon", "Coupon Rate"],
     "Currency": ["Currency", "ISO Currency", "Valuta"],
     "Sector": ["Sector", "Settore"],
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
@@ -49,54 +46,52 @@ REQUIRED_COLS_ALIASES = {
 }
 
 
-@st.cache_data(show_spinner=False)
-def _read_csv_any(file) -> pd.DataFrame:
-    # file can be a path or a BytesIO/StringIO from Streamlit uploader
+def _read_csv_any(uploaded) -> pd.DataFrame:
+    # uploaded: bytesIO or path-like
     encodings = ["utf-8", "ISO-8859-1", "latin1", "cp1252"]
     last_err = None
     for enc in encodings:
         try:
-            return pd.read_csv(file, encoding=enc)
+            if hasattr(uploaded, "read"):
+                uploaded.seek(0)
+                return pd.read_csv(uploaded, encoding=enc)
+            else:
+                return pd.read_csv(uploaded, encoding=enc)
         except Exception as e:
             last_err = e
-            if hasattr(file, "seek"):
-                file.seek(0)
-    # re-raise last error if all failed
-    raise last_err  # type: ignore[misc]
+    raise last_err
 
 
 def load_data(uploaded) -> pd.DataFrame:
     df = _read_csv_any(uploaded)
 
-    # If first data row duplicates headers, drop it
+    # drop duplicated header row if present
     if "ISIN" in df.columns and isinstance(df.loc[0, "ISIN"], str) and df.loc[0, "ISIN"].strip().upper() == "ISIN":
         df = df.iloc[1:].reset_index(drop=True)
 
-    # Unify schema
+    # unify column names
     rename_map = {}
-    for std_name, aliases in REQUIRED_COLS_ALIASES.items():
+    for std, aliases in REQUIRED_COLS_ALIASES.items():
         for a in aliases:
             if a in df.columns:
-                rename_map[a] = std_name
+                rename_map[a] = std
                 break
     df = df.rename(columns=rename_map)
 
-    # Mandatory columns
-    for col in ["Comparto", "ISIN", "Issuer", "Maturity", "Currency", "ScoreRendimento", "ScoreRischio"]:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}. Found: {list(df.columns)}")
+    # check mandatory columns
+    for c in ["Comparto", "ISIN", "Issuer", "Maturity", "Currency", "ScoreRendimento", "ScoreRischio"]:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}. Found columns: {list(df.columns)}")
 
-    # Parse & types
+    # parse and normalize
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
     df["ScoreRendimento"] = pd.to_numeric(df["ScoreRendimento"], errors="coerce")
     df["ScoreRischio"] = pd.to_numeric(df["ScoreRischio"], errors="coerce")
 
-    # Optional columns fallback
+    # ensure optional columns exist
     if "IssuerType" not in df.columns:
         df["IssuerType"] = df["Comparto"].astype(str).map(_infer_issuer_type)
-
     if "Sector" not in df.columns:
-        # if missing entirely, create with Government/Unknown based on IssuerType
         df["Sector"] = np.where(df["IssuerType"].str.contains("Govt", case=False, na=False), "Government", "Unknown")
     else:
         mask_na = df["Sector"].isna()
@@ -106,14 +101,27 @@ def load_data(uploaded) -> pd.DataFrame:
             "Unknown",
         )
 
-    # Derived features
+    # Maturity buckets
     today = pd.Timestamp.today().normalize()
     df["YearsToMaturity"] = (df["Maturity"] - today).dt.days / 365.25
-    df["MaturityBucket"] = df["YearsToMaturity"].apply(_maturity_bucket)
 
-    # Percentiles within Comparto
+    def _maturity_bucket(years):
+        if pd.isna(years):
+            return "Unknown"
+        if years <= 3:
+            return "Short"
+        if years <= 7:
+            return "Medium"
+        return "Long"
+
+    df["Scadenza"] = df["YearsToMaturity"].apply(_maturity_bucket)
+
+    # percentili per comparto
     df["Perc_ScoreRendimento"] = df.groupby("Comparto")["ScoreRendimento"].rank(pct=True) * 100
     df["Perc_ScoreRischio"] = df.groupby("Comparto")["ScoreRischio"].rank(pct=True) * 100
+
+    # standard alias columns expected in UI
+    df = df.rename(columns={"Currency": "Valuta", "IssuerType": "TipoEmittente", "Sector": "Settore"})
 
     return df
 
@@ -131,52 +139,74 @@ def _infer_issuer_type(comparto: str) -> str:
     return "Unknown"
 
 
-def _maturity_bucket(years: Optional[float]) -> str:
-    if years is None or (isinstance(years, float) and math.isnan(years)):
-        return "Unknown"
-    if years <= 3:
-        return "Short"
-    if years <= 7:
-        return "Medium"
-    return "Long"
-
 # =============================
-# Filters & Portfolio Builder
+# Filtering universe with fallback
 # =============================
 
-def filtro_titoli(df: pd.DataFrame) -> pd.DataFrame:
-    cond1 = df["ScoreRendimento"] >= 20
-    cond2 = (df["Perc_ScoreRendimento"] > 50) & (df["Perc_ScoreRischio"] > 90)
-    cond3 = (df["Perc_ScoreRendimento"] > 90) & (df["Perc_ScoreRischio"] > 50)
-    return df[cond1 & (cond2 | cond3)].copy()
+def filter_universe(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the strict selection rules with fallback relaxation.
 
+    Rules:
+    - mandatory: ScoreRendimento >= 20 (always enforced)
+    - strict: keep those that satisfy either:
+         (Perc_Rend >50 AND Perc_Risk >90) OR (Perc_Rend >90 AND Perc_Risk >50)
+    - if strict returns empty -> relax percentile checks and keep any with ScoreRendimento >=20
+    """
+    df = df.copy()
+    base = df[df["ScoreRendimento"] >= 20]
+    if base.empty:
+        return base
+
+    cond1 = (base["Perc_ScoreRendimento"] > 50) & (base["Perc_ScoreRischio"] > 90)
+    cond2 = (base["Perc_ScoreRendimento"] > 90) & (base["Perc_ScoreRischio"] > 50)
+    strict = base[cond1 | cond2].copy()
+    if not strict.empty:
+        return strict
+
+    # fallback: try relaxed combinations: allow >=50 or >=90 on either side
+    relaxed = base[
+        ((base["Perc_ScoreRendimento"] > 50) & (base["Perc_ScoreRischio"] > 50))
+        | ((base["Perc_ScoreRendimento"] > 40) & (base["Perc_ScoreRischio"] > 40))
+    ].copy()
+    if not relaxed.empty:
+        return relaxed
+
+    # final fallback: only score rendimento >=20
+    return base
+
+
+# =============================
+# Portfolio builder (hard constraints + soft fallback)
+# =============================
 
 @dataclass
 class Weights:
-    currency: Dict[str, float]
-    issuer_type: Dict[str, float]
-    sector: Dict[str, float]
-    maturity: Dict[str, float]
+    valuta: Dict[str, float]
+    tipo_emittente: Dict[str, float]
+    settore: Dict[str, float]
+    scadenza: Dict[str, float]
 
     def normalized(self) -> "Weights":
         return Weights(
-            currency=_normalize(self.currency),
-            issuer_type=_normalize(self.issuer_type),
-            sector=_normalize(self.sector),
-            maturity=_normalize(self.maturity),
+            valuta=_normalize(self.valuta),
+            tipo_emittente=_normalize(self.tipo_emittente),
+            settore=_normalize(self.settore),
+            scadenza=_normalize(self.scadenza),
         )
 
 
 def _normalize(d: Dict[str, float]) -> Dict[str, float]:
     d = {k: float(v) for k, v in d.items() if pd.notna(v)}
     total = sum(d.values())
-    if total <= 0:
-        return {k: 100.0 / len(d) for k in d} if d else {}
+    if total <= 0 or len(d) == 0:
+        return {}
     return {k: (v / total) * 100.0 for k, v in d.items()}
 
 
-def targets_from_weights(n: int, w: Weights) -> Dict[str, Dict[str, int]]:
+def _targets_from_weights(n: int, w: Weights) -> Dict[str, Dict[str, int]]:
     def alloc(weights: Dict[str, float]) -> Dict[str, int]:
+        if not weights:
+            return {}
         raw = {k: n * (v / 100.0) for k, v in weights.items()}
         floor = {k: int(math.floor(x)) for k, x in raw.items()}
         remainder = sorted(((raw[k] - floor[k], k) for k in raw), reverse=True)
@@ -186,212 +216,255 @@ def targets_from_weights(n: int, w: Weights) -> Dict[str, Dict[str, int]]:
             floor[k] += 1
         return floor
 
-    w = w.normalized()
+    wn = w.normalized()
     return {
-        "currency": alloc(w.currency),
-        "issuer_type": alloc(w.issuer_type),
-        "sector": alloc(w.sector),
-        "maturity": alloc(w.maturity),
+        "Valuta": alloc(wn.valuta),
+        "TipoEmittente": alloc(wn.tipo_emittente),
+        "Settore": alloc(wn.settore),
+        "Scadenza": alloc(wn.scadenza),
     }
 
 
 def build_portfolio(df: pd.DataFrame, n: int, w: Weights) -> pd.DataFrame:
-    w = w.normalized()
-    targets = targets_from_weights(n, w)
+    df = df.copy()
+    wn = w.normalized()
+    targets = _targets_from_weights(n, w)
 
-    counts = {k: {kk: 0 for kk in v} for k, v in targets.items()}
-    selected = []
-    candidates = df.sort_values(["ScoreRendimento"], ascending=[False]).reset_index(drop=True)
+    # Hard constraints selection
+    selected = pd.DataFrame()
+    feasible = True
 
-    def penalty(row) -> float:
-        cur = str(row.get("Currency", "Unknown"))
-        it = str(row.get("IssuerType", "Unknown"))
-        sec = str(row.get("Sector", "Unknown"))
-        mat = str(row.get("MaturityBucket", "Unknown"))
-        pen = 0.0
-        pen += _over_penalty(counts["currency"], targets["currency"], cur)
-        pen += _over_penalty(counts["issuer_type"], targets["issuer_type"], it)
-        pen += _over_penalty(counts["sector"], targets["sector"], sec)
-        pen += _over_penalty(counts["maturity"], targets["maturity"], mat)
-        # prefer combos aligned with larger weights
-        weight_prod = (
-            (w.currency.get(cur, 0) + 1e-9)
-            * (w.issuer_type.get(it, 0) + 1e-9)
-            * (w.sector.get(sec, 0) + 1e-9)
-            * (w.maturity.get(mat, 0) + 1e-9)
-        )
-        return pen - 1e-6 * weight_prod
-
-    for _ in range(n):
-        best_i, best_pen, best_ret = None, float("inf"), -float("inf")
-        for i, row in candidates.iterrows():
-            if i in selected:
+    for criterio, mapping in targets.items():
+        for cat, num in mapping.items():
+            if num <= 0:
                 continue
-            p = penalty(row)
-            r = float(row.get("ScoreRendimento", 0))
-            if p < best_pen or (abs(p - best_pen) < 1e-12 and r > best_ret):
-                best_i, best_pen, best_ret = i, p, r
+            subset = df[df[criterio] == cat].nlargest(num, "ScoreRendimento")
+            if len(subset) < num:
+                feasible = False
+            selected = pd.concat([selected, subset])
+
+    selected = selected.drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
+
+    if feasible and len(selected) >= n:
+        return selected.head(n)
+
+    # Soft fallback: greedy selection with penalties for exceeding targets
+    targets_counts = {k: dict(v) for k, v in targets.items()}
+    counts = {k: {kk: 0 for kk in v} for k, v in targets.items()}
+
+    candidates = df.sort_values("ScoreRendimento", ascending=False).reset_index()
+    final_idxs: List[int] = []
+
+    def penalty_for(row_idx) -> float:
+        row = candidates.loc[row_idx]
+        pen = 0.0
+        for crit, mapping in targets_counts.items():
+            key = row[crit]
+            cur = counts[crit].get(key, 0)
+            tgt = mapping.get(key, 0)
+            pen += max(0, (cur + 1) - tgt)  # positive if would exceed target
+        # small tie by ScoreRendimento already sorted
+        return pen
+
+    i_idx = 0
+    while len(final_idxs) < n and i_idx < len(candidates):
+        # evaluate minimal penalty among all remaining candidates
+        best_i = None
+        best_pen = float("inf")
+        for j in range(len(candidates)):
+            if candidates.loc[j, "index"] in final_idxs:
+                continue
+            pen = penalty_for(j)
+            if pen < best_pen:
+                best_pen = pen
+                best_i = j
         if best_i is None:
             break
-        row = candidates.loc[best_i]
-        selected.append(best_i)
+        chosen = candidates.loc[best_i]
+        final_idxs.append(int(chosen["index"]))
         # update counts
-        counts["currency"][str(row["Currency"])]= counts["currency"].get(str(row["Currency"]),0)+1
-        counts["issuer_type"][str(row["IssuerType"])]= counts["issuer_type"].get(str(row["IssuerType"]),0)+1
-        counts["sector"][str(row["Sector"])]= counts["sector"].get(str(row["Sector"]),0)+1
-        counts["maturity"][str(row["MaturityBucket"])]= counts["maturity"].get(str(row["MaturityBucket"]),0)+1
+        for crit in counts:
+            key = chosen[crit]
+            counts[crit][key] = counts[crit].get(key, 0) + 1
+        i_idx += 1
 
-    # fill if needed
-    if len(selected) < n:
-        for i in candidates.index:
-            if i not in selected:
-                selected.append(i)
-                if len(selected) >= n:
-                    break
+    # if still short, fill by highest ScoreRendimento remaining
+    if len(final_idxs) < n:
+        for _, r in df.iterrows():
+            if r["ISIN"] not in df.loc[df.index.intersection(df.index), "ISIN"].values:
+                continue
+        # simply append top scoring not already selected
+        for idx, row in df.iterrows():
+            if row["ISIN"] in df.loc[df.index.intersection(df.index), "ISIN"].values:
+                pass
+        # create final selection from DataFrame by index matching final_idxs (which are original df indices)
+    # Build final portfolio
+    portfolio = df.loc[final_idxs].drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
 
-    return candidates.loc[selected].reset_index(drop=True)
+    # If still less than n (due to indexing oddities), pad with top ScoreRendimento
+    if len(portfolio) < n:
+        remaining = df[~df["ISIN"].isin(portfolio["ISIN"])].nlargest(n - len(portfolio), "ScoreRendimento")
+        portfolio = pd.concat([portfolio, remaining]).reset_index(drop=True)
 
+    return portfolio.head(n)
 
-def _over_penalty(counts: Dict[str, int], targets: Dict[str, int], key: str) -> float:
-    cur = counts.get(key, 0)
-    tgt = targets.get(key, 0)
-    return max(0, (cur + 1) - tgt)
 
 # =============================
 # Streamlit UI
 # =============================
 
 st.set_page_config(page_title="Bond Portfolio Selector", layout="wide")
-st.title("📈 Bond Portfolio Selector")
+st.title("📈 Bond Portfolio Selector - versione completa")
 
-st.sidebar.header("1) Carica dati")
-uploaded = st.sidebar.file_uploader("CSV dei titoli", type=["csv"])  # expects RepBondPlus_20250825.csv-like schema
+st.sidebar.header("Carica dati")
+uploaded = st.sidebar.file_uploader("Carica un CSV (RepBondPlus) o trascina qui", type=["csv"]) 
 
-col_main, col_side = st.columns([3, 2], vertical_alignment="top")
+if uploaded is None:
+    st.info("Carica il file CSV (schema RepBondPlus). Le colonne obbligatorie: Comparto, ISIN, Issuer, Maturity, Currency/Valuta, ScoreRendimento, ScoreRischio.")
+    st.stop()
 
-with col_main:
-    if uploaded is None:
-        st.info("Carica un CSV per iniziare. Le colonne richieste sono: Comparto, ISIN, Issuer, Maturity, Currency, ScoreRendimento, ScoreRischio. Colonne opzionali: Sector, IssuerType.")
-    else:
-        try:
-            df = load_data(uploaded)
-        except Exception as e:
-            st.error(f"Errore nel parsing del CSV: {e}")
-            st.stop()
+try:
+    df = load_data(uploaded)
+except Exception as e:
+    st.error(f"Errore nel caricamento del CSV: {e}")
+    st.stop()
 
-        st.success(f"File caricato: {len(df)} righe")
-        with st.expander("Anteprima dati", expanded=False):
-            st.dataframe(df.head(20))
+st.success(f"Dati caricati: {len(df)} righe")
 
-        # Apply score filter
-        df_filt = filtro_titoli(df)
-        st.subheader("Titoli filtrati per Score")
-        st.caption("Regola: ScoreRendimento >= 20 e (PercRet>50% & PercRischio>90% oppure PercRet>90% & PercRischio>50%)")
-        st.dataframe(
-            df_filt[[
-                "Comparto","ISIN","Issuer","Currency","IssuerType","Sector","Maturity",
-                "ScoreRendimento","ScoreRischio","Perc_ScoreRendimento","Perc_ScoreRischio","MaturityBucket"
-            ]]
-        )
+with st.expander("Anteprima dati (prime 20 righe)"):
+    st.dataframe(df.head(20))
 
-        if df_filt.empty:
-            st.error("Nessun titolo soddisfa i criteri. Verifica il dataset o i punteggi.")
-            st.stop()
+# Apply initial strict filter with fallback
+universe = filter_universe(df)
+st.markdown(f"**Titoli disponibili dopo filtro (ScoreRendimento>=20 + criteri percentili con fallback):** {len(universe)}")
+if universe.empty:
+    st.warning("Nessun titolo passa nemmeno il vincolo ScoreRendimento >= 20. Controlla i dati.")
 
-        # Controls
-        st.subheader("Impostazioni portafoglio")
-        n_sel = st.slider("Numero titoli nel portafoglio", 5, 100, 20, step=1)
+# Selection parameters
+st.sidebar.header("Parametri portafoglio")
+n = st.sidebar.number_input("Numero titoli", min_value=1, max_value=200, value=20)
 
-        # Build weight inputs from available values
-        def weight_inputs(label: str, values: List[str]) -> Dict[str, float]:
-            st.markdown(f"**{label}**")
-            cols = st.columns(3)
-            weights: Dict[str, float] = {}
-            for i, val in enumerate(sorted(values)):
-                with cols[i % 3]:
-                    weights[val] = st.number_input(f"{val}", min_value=0.0, max_value=100.0, value=0.0, step=1.0, key=f"w_{label}_{val}")
-            return weights
+# Prepare weight inputs
+st.header("Imposta i pesi target (% per ciascun gruppo)")
+st.markdown("Lascia 0 per le categorie che non vuoi considerare; se una categoria è completamente vuota verrà riempita automaticamente con pesi uguali tra le sue voci.")
 
-        st.markdown("### Pesi target (somma 100 ciascuno; se ≠100 verranno normalizzati)")
-        w_cur = weight_inputs("Valuta", sorted(df_filt["Currency"].dropna().astype(str).unique()))
-        w_iss = weight_inputs("Tipo Emittente", sorted(df_filt["IssuerType"].dropna().astype(str).unique()))
-        w_sec = weight_inputs("Settore", sorted(df_filt["Sector"].dropna().astype(str).unique()))
-        w_mat = weight_inputs("Scadenza (bucket)", ["Short","Medium","Long"])  # buckets already computed
+cols_sel = st.columns(2)
+with cols_sel[0]:
+    st.subheader("Valuta")
+    unique_val = sorted(universe["Valuta"].dropna().astype(str).unique())
+    w_val = {}
+    for v in unique_val:
+        w_val[v] = st.number_input(f"{v} (%)", min_value=0.0, max_value=100.0, value=0.0, key=f"w_val_{v}")
+with cols_sel[1]:
+    st.subheader("Tipo Emittente")
+    unique_iss = sorted(universe["TipoEmittente"].dropna().astype(str).unique())
+    w_iss = {}
+    for it in unique_iss:
+        w_iss[it] = st.number_input(f"{it} (%)", min_value=0.0, max_value=100.0, value=0.0, key=f"w_iss_{it}")
 
-        st.caption("Suggerimento: imposta solo le categorie rilevanti (>0). Le altre verranno ignorate.")
+cols_sel2 = st.columns(2)
+with cols_sel2[0]:
+    st.subheader("Settore")
+    unique_sec = sorted(universe["Settore"].dropna().astype(str).unique())
+    w_sec = {}
+    for s in unique_sec:
+        w_sec[s] = st.number_input(f"{s} (%)", min_value=0.0, max_value=100.0, value=0.0, key=f"w_sec_{s}")
+with cols_sel2[1]:
+    st.subheader("Scadenza")
+    unique_mat = ["Short", "Medium", "Long"]
+    w_mat = {}
+    for m in unique_mat:
+        w_mat[m] = st.number_input(f"{m} (%)", min_value=0.0, max_value=100.0, value=0.0, key=f"w_mat_{m}")
 
-        # Clean zeros
-        w_cur = {k:v for k,v in w_cur.items() if v>0}
-        w_iss = {k:v for k,v in w_iss.items() if v>0}
-        w_sec = {k:v for k,v in w_sec.items() if v>0}
-        w_mat = {k:v for k,v in w_mat.items() if v>0}
+# Clean zeros and ensure non-empty per group
+def ensure_weights(weights: Dict[str, float], universe: List[str]) -> Dict[str, float]:
+    cleaned = {k: v for k, v in weights.items() if v > 0}
+    if not cleaned:
+        if not universe:
+            return {}
+        eq = 100.0 / len(universe)
+        return {k: eq for k in universe}
+    return cleaned
 
-        # If any group left empty, auto-fill equal weights from available values
-        def ensure_or_equal(weights: Dict[str, float], universe: List[str]) -> Dict[str, float]:
-            if weights:
-                return weights
-            if not universe:
-                return {}
-            eq = 100.0 / len(universe)
-            return {k: eq for k in universe}
+w_val = ensure_weights(w_val, unique_val)
+w_iss = ensure_weights(w_iss, unique_iss)
+w_sec = ensure_weights(w_sec, unique_sec)
+w_mat = ensure_weights(w_mat, unique_mat)
 
-        w_cur = ensure_or_equal(w_cur, sorted(df_filt["Currency"].dropna().astype(str).unique()))
-        w_iss = ensure_or_equal(w_iss, sorted(df_filt["IssuerType"].dropna().astype(str).unique()))
-        w_sec = ensure_or_equal(w_sec, sorted(df_filt["Sector"].dropna().astype(str).unique()))
-        w_mat = ensure_or_equal(w_mat, ["Short","Medium","Long"])  # always offer three buckets
+# Validate sums (we'll normalize internally if sums ≠ 100 but warn)
+def percent_sum(d: Dict[str, float]) -> float:
+    return sum(d.values())
 
-        weights = Weights(currency=w_cur, issuer_type=w_iss, sector=w_sec, maturity=w_mat)
+warn_msgs = []
+if abs(percent_sum(w_val) - 100.0) > 1e-6:
+    warn_msgs.append(f"Valuta sum = {percent_sum(w_val):.1f}% (will be normalized)")
+if abs(percent_sum(w_iss) - 100.0) > 1e-6:
+    warn_msgs.append(f"TipoEmittente sum = {percent_sum(w_iss):.1f}% (will be normalized)")
+if abs(percent_sum(w_sec) - 100.0) > 1e-6:
+    warn_msgs.append(f"Settore sum = {percent_sum(w_sec):.1f}% (will be normalized)")
+if abs(percent_sum(w_mat) - 100.0) > 1e-6:
+    warn_msgs.append(f"Scadenza sum = {percent_sum(w_mat):.1f}% (will be normalized)")
 
-        # Action
-        if st.button("🧮 Costruisci portafoglio", type="primary"):
-            portfolio = build_portfolio(df_filt, n_sel, weights)
+if warn_msgs:
+    for m in warn_msgs:
+        st.warning(m)
+    st.info("I pesi verranno normalizzati automaticamente per la costruzione del portafoglio.")
 
-            st.subheader("📊 Portafoglio selezionato")
-            st.dataframe(portfolio[[
-                "Comparto","ISIN","Issuer","Currency","IssuerType","Sector","Maturity",
-                "ScoreRendimento","ScoreRischio","Perc_ScoreRendimento","Perc_ScoreRischio","MaturityBucket"
-            ]])
+# Action
+if st.button("Costruisci portafoglio"):
+    if universe.empty:
+        st.error("Nessun titolo disponibile nel universe after filters.")
+        st.stop()
 
-            # Download
-            csv = portfolio.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Scarica CSV", data=csv, file_name="portafoglio.csv", mime="text/csv")
+    weights = Weights(valuta=w_val, tipo_emittente=w_iss, settore=w_sec, scadenza=w_mat)
+    port = build_portfolio(universe, int(n), weights)
 
-            # Distributions
-            st.markdown("### Distribuzioni effettive (% numero titoli)")
-            colA, colB, colC, colD = st.columns(4)
-            for col, series, title in [
-                (colA, portfolio["Currency"], "Valuta"),
-                (colB, portfolio["IssuerType"], "Tipo Emittente"),
-                (colC, portfolio["Sector"], "Settore"),
-                (colD, portfolio["MaturityBucket"], "Scadenza"),
-            ]:
-                with col:
-                    if series.empty:
-                        st.write("—")
-                    else:
-                        share = (series.value_counts(normalize=True) * 100).round(1)
-                        st.bar_chart(share)
+    if port.empty:
+        st.error("Impossibile costruire un portafoglio con i parametri forniti.")
+        st.stop()
 
-with col_side:
-    st.header("Guida rapida")
-    st.markdown(
-        """
-        **Passi**
-        1. Carica il CSV dei titoli (schema RepBondPlus).
-        2. Verifica i titoli filtrati secondo gli Score richiesti.
-        3. Imposta i pesi target (Valuta / Emittente / Settore / Scadenza).
-        4. Premi **Costruisci portafoglio** per vedere i risultati e scaricare il CSV.
-        
-        **Note**
-        - Se i pesi non sommano a 100, verranno normalizzati automaticamente.
-        - Le scadenze sono bucketizzate in **Short (≤3y)**, **Medium (3–7y)**, **Long (>7y)**.
-        - La selezione è greedy con penalità quando si supera il target.
-        """
-    )
+    st.success(f"Portafoglio generato: {len(port)} titoli")
+    with st.expander("Portafoglio - tabella completa"):
+        st.dataframe(port)
 
-# =============================
-# requirements.txt content (place in a separate file when deploying)
-# =============================
-# streamlit>=1.35
-# pandas>=2.2
-# numpy>=1.26
+    # Download
+    csv = port.to_csv(index=False).encode("utf-8")
+    st.download_button("Scarica CSV portafoglio", data=csv, file_name="portafoglio.csv", mime="text/csv")
+
+    # Compare target vs actual
+    def compute_dist(df_port, col):
+        return (df_port[col].value_counts(normalize=True) * 100).round(1)
+
+    distr = {
+        "Valuta": (w_val, compute_dist(port, "Valuta")),
+        "TipoEmittente": (w_iss, compute_dist(port, "TipoEmittente")),
+        "Settore": (w_sec, compute_dist(port, "Settore")),
+        "Scadenza": (w_mat, compute_dist(port, "Scadenza")),
+    }
+
+    st.header("Confronto Target vs Effettivo")
+    for crit, (target, actual) in distr.items():
+        st.subheader(crit)
+        df_cmp = pd.DataFrame({"Target %": pd.Series(target), "Effettivo %": actual}).fillna(0)
+        st.dataframe(df_cmp)
+
+        # pie
+        fig1, ax1 = plt.subplots()
+        if not actual.empty:
+            actual.plot.pie(autopct="%1.1f%%", ax=ax1)
+        ax1.set_ylabel("")
+        ax1.set_title(f"Distribuzione effettiva - {crit}")
+        st.pyplot(fig1)
+
+        # bar grouped
+        fig2, ax2 = plt.subplots()
+        df_cmp.plot(kind="bar", ax=ax2)
+        ax2.set_ylabel("Percentuale (%)")
+        ax2.set_title(f"Target vs Effettivo - {crit}")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig2)
+
+    st.balloons()
+
+# End of file
