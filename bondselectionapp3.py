@@ -217,42 +217,112 @@ def _targets_from_weights(n: int, w: Weights) -> Dict[str, Dict[str, int]]:
     }
 
 
+def _build_portfolio_soft(df: pd.DataFrame, n: int, targets: Dict[str, Dict[str, int]]) -> pd.DataFrame:
+    """Greedy soft fallback: pick up to n bonds minimizing target overruns, tie-break by ScoreRendimento."""
+    # initialize counts for constrained categories
+    counts = {crit: {k: 0 for k in v} for crit, v in targets.items()}
+    candidates = df.sort_values("ScoreRendimento", ascending=False).reset_index(drop=True)
+
+    selected_rows: List[pd.Series] = []
+    selected_isins: set = set()
+
+    while len(selected_rows) < n and not candidates.empty:
+        best_idx = None
+        best_pen = float("inf")
+        best_score = -float("inf")
+        # evaluate penalty for each candidate
+        for idx, row in candidates.iterrows():
+            isin = row.get("ISIN")
+            if isin in selected_isins:
+                continue
+            pen = 0.0
+            for crit, mapping in targets.items():
+                if not mapping:
+                    continue
+                key = row.get(crit)
+                cur = counts[crit].get(key, 0)
+                tgt = mapping.get(key, 0)
+                # only penalize when there's a positive target (i.e., user constrained this category)
+                if tgt > 0:
+                    pen += max(0, (cur + 1) - tgt)
+            score = float(row.get("ScoreRendimento") or 0)
+            if pen < best_pen or (abs(pen - best_pen) < 1e-12 and score > best_score):
+                best_pen = pen
+                best_score = score
+                best_idx = idx
+        if best_idx is None:
+            break
+        chosen = candidates.loc[best_idx]
+        selected_rows.append(chosen)
+        selected_isins.add(chosen.get("ISIN"))
+        # update counts
+        for crit in counts:
+            key = chosen.get(crit)
+            counts[crit][key] = counts[crit].get(key, 0) + 1
+        # drop chosen from candidates
+        candidates = candidates.drop(best_idx).reset_index(drop=True)
+
+    df_selected = pd.DataFrame(selected_rows).reset_index(drop=True)
+    # pad if still short
+    if len(df_selected) < n:
+        remaining = df[~df["ISIN"].isin(df_selected.get("ISIN", pd.Series(dtype=object)))].nlargest(n - len(df_selected), "ScoreRendimento")
+        df_selected = pd.concat([df_selected, remaining]).reset_index(drop=True)
+    return df_selected.head(n)
+
+
 def build_portfolio(df: pd.DataFrame, n: int, w: Weights) -> pd.DataFrame:
+    """Hard constraints on TipoEmittente (if provided) and fallback to a soft greedy solver.
+
+    Behavior:
+    - Compute integer targets from weights.
+    - If TipoEmittente targets are provided, attempt to satisfy them exactly by selecting
+      top ScoreRendimento within each issuer-type. If any issuer lacks enough bonds, fall
+      back to the soft solver.
+    - If TipoEmittente targets are not provided, run the soft solver directly.
+    """
     df = df.copy()
     targets = _targets_from_weights(n, w)
 
-    selected = pd.DataFrame()
-    feasible = True
-
-    for criterio, mapping in targets.items():
-        for cat, num in mapping.items():
-            if num <= 0:
+    # Enforce hard constraints for TipoEmittente if present
+    tipo_targets = targets.get("TipoEmittente", {}) or {}
+    if tipo_targets:
+        # select required number per issuer type
+        selected_list: List[pd.DataFrame] = []
+        for tipo, cnt in tipo_targets.items():
+            if cnt <= 0:
                 continue
-            subset = df[df[criterio] == cat].nlargest(num, "ScoreRendimento")
-            if len(subset) < num:
-                feasible = False
-            selected = pd.concat([selected, subset])
+            group = df[df["TipoEmittente"] == tipo]
+            picked = group.nlargest(cnt, "ScoreRendimento")
+            if len(picked) < cnt:
+                # not enough candidates for this issuer type -> fallback soft
+                return _build_portfolio_soft(df, n, targets)
+            selected_list.append(picked)
 
-    selected = selected.drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
+        selected = pd.concat(selected_list, ignore_index=True)
+        selected = selected.drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
 
-    if feasible and len(selected) >= n:
-        return selected.head(n)
+        # If we have exactly n, done
+        if len(selected) == n:
+            return selected
+        # If somehow more (shouldn't happen because TipoEmittente partitions are disjoint), trim
+        if len(selected) > n:
+            return selected.nlargest(n, "ScoreRendimento").reset_index(drop=True)
 
-    # fallback greedy
-    candidates = df.sort_values("ScoreRendimento", ascending=False).reset_index()
-    final_idxs: List[int] = []
+        # If fewer than n (rare), fill remaining trying to respect other targets via soft solver on remainder
+        remaining_needed = n - len(selected)
+        remainder_df = df[~df["ISIN"].isin(selected["ISIN"])].copy()
+        # Build sub-targets for remainder: keep original targets but reduce counts by already selected
+        reduced_targets = {crit: dict(mapping) for crit, mapping in targets.items()}
+        for crit in reduced_targets:
+            for k in list(reduced_targets[crit].keys()):
+                already = int(selected[crit].value_counts().get(k, 0)) if crit in selected.columns else 0
+                reduced_targets[crit][k] = max(0, reduced_targets[crit].get(k, 0) - already)
+        extra = _build_portfolio_soft(remainder_df, remaining_needed, reduced_targets)
+        final = pd.concat([selected, extra], ignore_index=True)
+        return final.head(n)
 
-    while len(final_idxs) < n and len(final_idxs) < len(candidates):
-        chosen = candidates.loc[len(final_idxs)]
-        final_idxs.append(int(chosen["index"]))
-
-    portfolio = df.loc[final_idxs].drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
-
-    if len(portfolio) < n:
-        remaining = df[~df["ISIN"].isin(portfolio["ISIN"])].nlargest(n - len(portfolio), "ScoreRendimento")
-        portfolio = pd.concat([portfolio, remaining]).reset_index(drop=True)
-
-    return portfolio.head(n)
+    # No hard issuer constraints -> use soft solver
+    return _build_portfolio_soft(df, n, targets)
 
 
 # =============================
