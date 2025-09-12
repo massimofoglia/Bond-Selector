@@ -41,8 +41,8 @@ REQUIRED_COLS_ALIASES = {
     "Currency": ["Currency", "ISO Currency", "Valuta"],
     "Sector": ["Sector", "Settore"],
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
-    "ScoreRendimento": ["ScoreRendimento", "ScoreRet"],
-    "ScoreRischio": ["ScoreRischio", "ScoreRisk"],
+    "ScoreRendimento": ["ScoreRendimento", "ScoreRet", "Score Rendimento"],
+    "ScoreRischio": ["ScoreRischio", "ScoreRisk", "Score Rischio"],
 }
 
 
@@ -63,9 +63,12 @@ def _read_csv_any(uploaded) -> pd.DataFrame:
 
 def load_data(uploaded) -> pd.DataFrame:
     df = _read_csv_any(uploaded)
+
+    # sometimes exported files include an extra header row as data
     if "ISIN" in df.columns and isinstance(df.loc[0, "ISIN"], str) and df.loc[0, "ISIN"].strip().upper() == "ISIN":
         df = df.iloc[1:].reset_index(drop=True)
 
+    # unify column names using aliases
     rename_map = {}
     for std, aliases in REQUIRED_COLS_ALIASES.items():
         for a in aliases:
@@ -74,14 +77,17 @@ def load_data(uploaded) -> pd.DataFrame:
                 break
     df = df.rename(columns=rename_map)
 
+    # required columns check
     for c in ["Comparto", "ISIN", "Issuer", "Maturity", "Currency", "ScoreRendimento", "ScoreRischio"]:
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}. Found columns: {list(df.columns)}")
 
+    # parse types
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
     df["ScoreRendimento"] = pd.to_numeric(df["ScoreRendimento"], errors="coerce")
     df["ScoreRischio"] = pd.to_numeric(df["ScoreRischio"], errors="coerce")
 
+    # infer optional columns
     if "IssuerType" not in df.columns:
         df["IssuerType"] = df["Comparto"].astype(str).map(_infer_issuer_type)
     if "Sector" not in df.columns:
@@ -94,6 +100,7 @@ def load_data(uploaded) -> pd.DataFrame:
             "Unknown",
         )
 
+    # maturity buckets
     today = pd.Timestamp.today().normalize()
     df["YearsToMaturity"] = (df["Maturity"] - today).dt.days / 365.25
 
@@ -108,13 +115,20 @@ def load_data(uploaded) -> pd.DataFrame:
 
     df["Scadenza"] = df["YearsToMaturity"].apply(_maturity_bucket)
 
+    # percentiles inside Comparto
     df["Perc_ScoreRendimento"] = df.groupby("Comparto")["ScoreRendimento"].rank(pct=True) * 100
     df["Perc_ScoreRischio"] = df.groupby("Comparto")["ScoreRischio"].rank(pct=True) * 100
 
+    # standard column names for UI
     df = df.rename(columns={"Currency": "Valuta", "IssuerType": "TipoEmittente", "Sector": "Settore"})
 
-    # Re-map settori: Govt / Financials / Non Financials
+    # remap Settore into 3 groups
     df["Settore"] = df["Settore"].apply(_map_sector)
+
+    # ensure string categories
+    for c in ["Valuta", "TipoEmittente", "Settore", "Scadenza"]:
+        if c in df.columns:
+            df[c] = df[c].fillna("Unknown").astype(str)
 
     return df
 
@@ -145,6 +159,7 @@ def _map_sector(s: str) -> str:
 # Filtering universe with fallback
 # =============================
 
+
 def filter_universe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     base = df[df["ScoreRendimento"] >= 20]
@@ -170,6 +185,7 @@ def filter_universe(df: pd.DataFrame) -> pd.DataFrame:
 # =============================
 # Portfolio builder
 # =============================
+
 
 @dataclass
 class Weights:
@@ -219,7 +235,6 @@ def _targets_from_weights(n: int, w: Weights) -> Dict[str, Dict[str, int]]:
 
 def _build_portfolio_soft(df: pd.DataFrame, n: int, targets: Dict[str, Dict[str, int]]) -> pd.DataFrame:
     """Greedy soft fallback: pick up to n bonds minimizing target overruns, tie-break by ScoreRendimento."""
-    # initialize counts for constrained categories
     counts = {crit: {k: 0 for k in v} for crit, v in targets.items()}
     candidates = df.sort_values("ScoreRendimento", ascending=False).reset_index(drop=True)
 
@@ -230,7 +245,6 @@ def _build_portfolio_soft(df: pd.DataFrame, n: int, targets: Dict[str, Dict[str,
         best_idx = None
         best_pen = float("inf")
         best_score = -float("inf")
-        # evaluate penalty for each candidate
         for idx, row in candidates.iterrows():
             isin = row.get("ISIN")
             if isin in selected_isins:
@@ -242,7 +256,6 @@ def _build_portfolio_soft(df: pd.DataFrame, n: int, targets: Dict[str, Dict[str,
                 key = row.get(crit)
                 cur = counts[crit].get(key, 0)
                 tgt = mapping.get(key, 0)
-                # only penalize when there's a positive target (i.e., user constrained this category)
                 if tgt > 0:
                     pen += max(0, (cur + 1) - tgt)
             score = float(row.get("ScoreRendimento") or 0)
@@ -255,15 +268,12 @@ def _build_portfolio_soft(df: pd.DataFrame, n: int, targets: Dict[str, Dict[str,
         chosen = candidates.loc[best_idx]
         selected_rows.append(chosen)
         selected_isins.add(chosen.get("ISIN"))
-        # update counts
         for crit in counts:
             key = chosen.get(crit)
             counts[crit][key] = counts[crit].get(key, 0) + 1
-        # drop chosen from candidates
         candidates = candidates.drop(best_idx).reset_index(drop=True)
 
     df_selected = pd.DataFrame(selected_rows).reset_index(drop=True)
-    # pad if still short
     if len(df_selected) < n:
         remaining = df[~df["ISIN"].isin(df_selected.get("ISIN", pd.Series(dtype=object)))].nlargest(n - len(df_selected), "ScoreRendimento")
         df_selected = pd.concat([df_selected, remaining]).reset_index(drop=True)
@@ -271,58 +281,84 @@ def _build_portfolio_soft(df: pd.DataFrame, n: int, targets: Dict[str, Dict[str,
 
 
 def build_portfolio(df: pd.DataFrame, n: int, w: Weights) -> pd.DataFrame:
-    """Hard constraints on TipoEmittente (if provided) and fallback to a soft greedy solver.
-
-    Behavior:
-    - Compute integer targets from weights.
-    - If TipoEmittente targets are provided, attempt to satisfy them exactly by selecting
-      top ScoreRendimento within each issuer-type. If any issuer lacks enough bonds, fall
-      back to the soft solver.
-    - If TipoEmittente targets are not provided, run the soft solver directly.
-    """
+    """Try to satisfy hard targets for all dimensions using a greedy coverage algorithm; fall back to soft if infeasible."""
     df = df.copy()
+    # Ensure category columns exist and are strings
+    for col in ["Valuta", "TipoEmittente", "Settore", "Scadenza"]:
+        if col not in df.columns:
+            df[col] = "Unknown"
+        df[col] = df[col].fillna("Unknown").astype(str)
+
     targets = _targets_from_weights(n, w)
 
-    # Enforce hard constraints for TipoEmittente if present
-    tipo_targets = targets.get("TipoEmittente", {}) or {}
-    if tipo_targets:
-        # select required number per issuer type
-        selected_list: List[pd.DataFrame] = []
-        for tipo, cnt in tipo_targets.items():
-            if cnt <= 0:
+    # If no targets provided at all, just return top-n
+    if not any(targets.values()):
+        return df.nlargest(n, "ScoreRendimento").reset_index(drop=True)
+
+    # prepare remaining needs (mutable)
+    needs = {crit: dict(mapping) for crit, mapping in targets.items()}
+
+    candidates = df.sort_values("ScoreRendimento", ascending=False).reset_index(drop=True)
+    selected = []
+    selected_isins = set()
+
+    dims = ["TipoEmittente", "Valuta", "Settore", "Scadenza"]
+
+    # Greedy: pick candidate that covers the largest number of still-needed categories
+    while len(selected) < n and not candidates.empty:
+        best_idx = None
+        best_cover = -1
+        best_score = -1.0
+        for idx, row in candidates.iterrows():
+            isin = row["ISIN"]
+            if isin in selected_isins:
                 continue
-            group = df[df["TipoEmittente"] == tipo]
-            picked = group.nlargest(cnt, "ScoreRendimento")
-            if len(picked) < cnt:
-                # not enough candidates for this issuer type -> fallback soft
-                return _build_portfolio_soft(df, n, targets)
-            selected_list.append(picked)
+            cover = 0
+            for dim in dims:
+                dim_needs = needs.get(dim, {})
+                if dim_needs and dim_needs.get(row[dim], 0) > 0:
+                    cover += 1
+            score = float(row.get("ScoreRendimento") or 0)
+            if cover > best_cover or (cover == best_cover and score > best_score):
+                best_cover = cover
+                best_score = score
+                best_idx = idx
+        if best_idx is None:
+            break
+        # if best_cover==0 means no remaining candidate helps satisfy any outstanding need -> infeasible
+        if best_cover == 0:
+            return _build_portfolio_soft(df, n, targets)
+        chosen = candidates.loc[best_idx]
+        selected.append(chosen)
+        selected_isins.add(chosen["ISIN"])
+        # decrement needs
+        for dim in dims:
+            if needs.get(dim) and needs[dim].get(chosen[dim], 0) > 0:
+                needs[dim][chosen[dim]] -= 1
+        # remove chosen from candidates
+        candidates = candidates.drop(best_idx).reset_index(drop=True)
 
-        selected = pd.concat(selected_list, ignore_index=True)
-        selected = selected.drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
+    # after selection, check if all needs satisfied
+    for dim, mapping in needs.items():
+        if any(v > 0 for v in mapping.values()):
+            return _build_portfolio_soft(df, n, targets)
 
-        # If we have exactly n, done
-        if len(selected) == n:
-            return selected
-        # If somehow more (shouldn't happen because TipoEmittente partitions are disjoint), trim
-        if len(selected) > n:
-            return selected.nlargest(n, "ScoreRendimento").reset_index(drop=True)
+    # if selected < n (all needs satisfied), fill with highest scoring remaining
+    if len(selected) < n:
+        remaining = df[~df["ISIN"].isin(selected_isins)].nlargest(n - len(selected), "ScoreRendimento")
+        for _, r in remaining.iterrows():
+            selected.append(r)
 
-        # If fewer than n (rare), fill remaining trying to respect other targets via soft solver on remainder
-        remaining_needed = n - len(selected)
-        remainder_df = df[~df["ISIN"].isin(selected["ISIN"])].copy()
-        # Build sub-targets for remainder: keep original targets but reduce counts by already selected
-        reduced_targets = {crit: dict(mapping) for crit, mapping in targets.items()}
-        for crit in reduced_targets:
-            for k in list(reduced_targets[crit].keys()):
-                already = int(selected[crit].value_counts().get(k, 0)) if crit in selected.columns else 0
-                reduced_targets[crit][k] = max(0, reduced_targets[crit].get(k, 0) - already)
-        extra = _build_portfolio_soft(remainder_df, remaining_needed, reduced_targets)
-        final = pd.concat([selected, extra], ignore_index=True)
-        return final.head(n)
+    portfolio = pd.DataFrame(selected).drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
+    # ensure exactly n
+    if len(portfolio) > n:
+        portfolio = portfolio.nlargest(n, "ScoreRendimento").reset_index(drop=True)
+    if len(portfolio) < n:
+        # pad with top remaining
+        remaining = df[~df["ISIN"].isin(portfolio["ISIN"])].nlargest(n - len(portfolio), "ScoreRendimento")
+        portfolio = pd.concat([portfolio, remaining]).reset_index(drop=True)
 
-    # No hard issuer constraints -> use soft solver
-    return _build_portfolio_soft(df, n, targets)
+    return portfolio.head(n)
 
 
 # =============================
@@ -359,7 +395,7 @@ st.sidebar.header("Parametri portafoglio")
 n = st.sidebar.number_input("Numero titoli", min_value=1, max_value=200, value=20)
 
 st.header("Imposta i pesi target (% per ciascun gruppo)")
-st.markdown("Se una sezione viene lasciata vuota, non sarà vincolante. I pesi inseriti devono sommare a 100.")
+st.markdown("I pesi devono essere inseriti per tutte le sezioni e sommare a 100 (vincoli hard). Se i vincoli non sono realizzabili il sistema userà il fallback soft.)")
 
 cols_sel = st.columns(2)
 with cols_sel[0]:
@@ -369,34 +405,39 @@ with cols_sel[0]:
 with cols_sel[1]:
     st.subheader("Tipo Emittente")
     unique_iss = sorted(universe["TipoEmittente"].dropna().astype(str).unique())
-    w_iss = {it: st.number_input(f"{it} (%)", min_value=0.0, max_value=100.0, value=0.0, key=f"w_iss_{it}") for it in unique_iss}
+    # ensure standard issuer types exist in UI
+    mandatory_issuers = [it for it in ["Govt", "Corporate Retail", "Corporate Istituzionali"] if it in unique_iss]
+    if not mandatory_issuers:
+        # fallback to detected ones
+        mandatory_issuers = unique_iss
+    w_iss = {it: st.number_input(f"{it} (%)", min_value=0.0, max_value=100.0, value=0.0, key=f"w_iss_{it}") for it in mandatory_issuers}
 
 cols_sel2 = st.columns(2)
 with cols_sel2[0]:
     st.subheader("Settore (Govt / Financials / Non Financials)")
-    unique_sec = sorted(universe["Settore"].dropna().astype(str).unique())
+    unique_sec = ["Govt", "Financials", "Non Financials"]
     w_sec = {s: st.number_input(f"{s} (%)", min_value=0.0, max_value=100.0, value=0.0, key=f"w_sec_{s}") for s in unique_sec}
 with cols_sel2[1]:
     st.subheader("Scadenza")
     unique_mat = ["Short", "Medium", "Long"]
     w_mat = {m: st.number_input(f"{m} (%)", min_value=0.0, max_value=100.0, value=0.0, key=f"w_mat_{m}") for m in unique_mat}
 
-# Check sums only if user provided nonzero weights
-def validate_weights(weights: Dict[str, float], label: str, mandatory: bool = False):
+
+def validate_weights(weights: Dict[str, float], label: str, mandatory: bool = True):
     total = sum(weights.values())
-    if total > 0 and abs(total - 100.0) > 1e-6:
-        st.error(f"I pesi per {label} devono sommare a 100. Attuale somma = {total:.1f}%")
+    if total <= 0:
+        st.error(f"Devi inserire pesi per {label} (obbligatorio). Somma attuale = {total}.")
         st.stop()
-    if mandatory and total == 0:
-        st.error(f"Devi inserire pesi per {label} (vincolo rigido).")
+    if abs(total - 100.0) > 1e-6:
+        st.error(f"I pesi per {label} devono sommare a 100. Attuale somma = {total:.1f}%")
         st.stop()
     return {k: v for k, v in weights.items() if v > 0}
 
-# Vincoli rigidi su TipoEmittente
-w_val = validate_weights(w_val, "Valuta")
+# Validate all weights (all hard)
+w_val = validate_weights(w_val, "Valuta", mandatory=True)
 w_iss = validate_weights(w_iss, "Tipo Emittente", mandatory=True)
-w_sec = validate_weights(w_sec, "Settore")
-w_mat = validate_weights(w_mat, "Scadenza")
+w_sec = validate_weights(w_sec, "Settore", mandatory=True)
+w_mat = validate_weights(w_mat, "Scadenza", mandatory=True)
 
 if st.button("Costruisci portafoglio"):
     if universe.empty:
@@ -404,9 +445,14 @@ if st.button("Costruisci portafoglio"):
         st.stop()
 
     weights = Weights(valuta=w_val, tipo_emittente=w_iss, settore=w_sec, scadenza=w_mat)
-    port = build_portfolio(universe, int(n), weights)
 
-    if port.empty:
+    try:
+        port = build_portfolio(universe, int(n), weights)
+    except Exception as e:
+        st.error(f"Errore nella costruzione del portafoglio: {e}")
+        st.stop()
+
+    if port is None or port.empty:
         st.error("Impossibile costruire un portafoglio con i parametri forniti.")
         st.stop()
 
@@ -414,9 +460,23 @@ if st.button("Costruisci portafoglio"):
     with st.expander("Portafoglio - tabella completa"):
         st.dataframe(port)
 
-    csv = port.to_csv(index=False).encode("utf-8")
+    # Prepare CSV export with target markers ("--" when not present)
+    export = port.copy()
+    dims = {
+        "Valuta": w_val,
+        "TipoEmittente": w_iss,
+        "Settore": w_sec,
+        "Scadenza": w_mat,
+    }
+    for dim, tgt in dims.items():
+        cats = sorted(set(list(tgt.keys()) + list(export[dim].astype(str).unique())))
+        for c in cats:
+            export[f"Target_{dim}_{c}"] = (tgt.get(c, "--") if isinstance(tgt, dict) else "--")
+
+    csv = export.to_csv(index=False).encode("utf-8")
     st.download_button("Scarica CSV portafoglio", data=csv, file_name="portafoglio.csv", mime="text/csv")
 
+    # ---- Confronto Target vs Effettivo ----
     def compute_dist(df_port, col):
         return (df_port[col].value_counts(normalize=True) * 100).round(1)
 
@@ -430,23 +490,29 @@ if st.button("Costruisci portafoglio"):
     st.header("Confronto Target vs Effettivo")
     for crit, (target, actual) in distr.items():
         st.subheader(crit)
-        df_cmp = pd.DataFrame({"Target %": pd.Series(target), "Effettivo %": actual}).fillna(0)
-        st.dataframe(df_cmp)
+        cats = sorted(set(list(target.keys()) + list(actual.index.astype(str))))
+        rows = []
+        for c in cats:
+            tgt_val = target.get(c) if isinstance(target, dict) else None
+            tgt_display = "--" if tgt_val is None else f"{tgt_val:.1f}"
+            act_val = float(actual.get(c, 0.0)) if not actual.empty else 0.0
+            rows.append({crit: c, "Target %": tgt_display, "Effettivo %": f"{act_val:.1f}"})
+        df_table = pd.DataFrame(rows)
+        st.dataframe(df_table)
 
-        fig1, ax1 = plt.subplots()
-        if not actual.empty:
-            actual.plot.pie(autopct="%1.1f%%", ax=ax1)
-        ax1.set_ylabel("")
-        ax1.set_title(f"Distribuzione effettiva - {crit}")
-        st.pyplot(fig1)
-
-        fig2, ax2 = plt.subplots()
-        df_cmp.plot(kind="bar", ax=ax2)
-        ax2.set_ylabel("Percentuale (%)")
-        ax2.set_title(f"Target vs Effettivo - {crit}")
-        plt.xticks(rotation=45)
+        tgt_nums = [target.get(c, 0.0) for c in cats]
+        act_nums = [float(actual.get(c, 0.0)) for c in cats]
+        fig, ax = plt.subplots()
+        x = range(len(cats))
+        width = 0.35
+        ax.bar([i - width/2 for i in x], act_nums, width=width, label="Effettivo")
+        ax.bar([i + width/2 for i in x], tgt_nums, width=width, label="Target")
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(cats, rotation=45)
+        ax.set_ylabel("Percentuale (%)")
+        ax.legend()
         plt.tight_layout()
-        st.pyplot(fig2)
+        st.pyplot(fig)
 
     st.balloons()
 
