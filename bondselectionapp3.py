@@ -186,6 +186,64 @@ def integer_targets_from_weights(n: int, weights: Dict[str, float]) -> Dict[str,
         floor[k] += 1
     return floor
 
+
+# -----------------------------
+# Pre-check diagnostics
+# -----------------------------
+
+def precheck_targets(df: pd.DataFrame, n: int, targ_val: Dict[str, float], targ_iss: Dict[str, float], targ_sec: Dict[str, float], targ_mat: Dict[str, float]) -> List[Dict[str, object]]:
+    """Return list of shortages (if any). For each target category compute total available and
+    maximum achievable considering corporate-uniqueness (corporates max 1 per issuer).
+    """
+    t_val = integer_targets_from_weights(n, targ_val)
+    t_iss = integer_targets_from_weights(n, targ_iss)
+    t_sec = integer_targets_from_weights(n, targ_sec)
+    t_mat = integer_targets_from_weights(n, targ_mat)
+
+    shortages = []
+
+    def check_mapping(mapping: Dict[str, int], col: str, dim_name: str):
+        for cat, req in mapping.items():
+            # rows matching this category
+            mask = df[col].astype(str) == str(cat)
+            total = int(mask.sum())
+            if total == 0:
+                shortages.append({"dim": dim_name, "category": cat, "required": req, "available": total, "max_possible": 0, "note": "Nessun titolo nella categoria"})
+                continue
+            # count government vs corporate within this mask
+            sub = df[mask]
+            corp_mask = sub["TipoEmittente"].str.contains("Corp", case=False, na=False) | sub["TipoEmittente"].str.contains("Corporate", case=False, na=False)
+            govt_mask = sub["TipoEmittente"].str.contains("Govt", case=False, na=False)
+            govt_count = int(govt_mask.sum())
+            corp_count = int(corp_mask.sum())
+            unique_corp_issuers = sub.loc[corp_mask, "Issuer"].nunique() if corp_count > 0 else 0
+            # maximum achievable in this category = all govt bonds + one per unique corporate issuer
+            max_possible = govt_count + unique_corp_issuers
+            if req > max_possible:
+                shortages.append({
+                    "dim": dim_name,
+                    "category": cat,
+                    "required": req,
+                    "available": total,
+                    "govt_count": govt_count,
+                    "corp_count": corp_count,
+                    "unique_corp_issuers": unique_corp_issuers,
+                    "max_possible": max_possible,
+                    "note": "Richiesta superiore al massimo ottenibile (considerando 1 corporate per issuer)",
+                })
+
+    if t_val:
+        check_mapping(t_val, "Valuta", "Valuta")
+    if t_iss:
+        check_mapping(t_iss, "TipoEmittente", "TipoEmittente")
+    if t_sec:
+        check_mapping(t_sec, "Settore", "Settore")
+    if t_mat:
+        check_mapping(t_mat, "Scadenza", "Scadenza")
+
+    return shortages
+
+
 # -----------------------------
 # MILP builder (uses PuLP)
 # -----------------------------
@@ -193,6 +251,12 @@ def integer_targets_from_weights(n: int, weights: Dict[str, float]) -> Dict[str,
 def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], targ_iss: Dict[str, float], targ_sec: Dict[str, float], targ_mat: Dict[str, float]) -> pd.DataFrame:
     if pulp is None:
         raise RuntimeError("PuLP non è installato. Esegui: pip install pulp")
+
+    # precheck and raise informative error if shortages exist
+    shortages = precheck_targets(df, n, targ_val, targ_iss, targ_sec, targ_mat)
+    if shortages:
+        lines = [f"{s['dim']}='{s['category']}': richiesti={s['required']}, disponibili={s.get('available',0)}, max_possible={s.get('max_possible',0)}" for s in shortages]
+        raise ValueError("Vincoli impossibili da soddisfare. Dettagli: " + "; ".join(lines))
 
     # compute integer targets per selected dimension
     t_val = integer_targets_from_weights(n, targ_val)
@@ -217,10 +281,8 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], t
     # category equality constraints
     def add_equal_constraints(mapping: Dict[str, int], col: str, dim_name: str):
         for cat, cnt in mapping.items():
-            # find indices matching category (string match)
             idxs = [i for i, v in df[col].astype(str).items() if v == str(cat)]
-            if len(idxs) < cnt:
-                raise ValueError(f"Impossibile soddisfare target {cnt} per {dim_name}='{cat}' (disponibili: {len(idxs)})")
+            # we've pre-checked availability; here we add equality constraint
             prob += pulp.lpSum([x[i] for i in idxs]) == cnt
 
     if t_val:
@@ -245,11 +307,102 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], t
     res = prob.solve(solver)
 
     if pulp.LpStatus[prob.status] != "Optimal":
-        raise ValueError(f"Solver non ha trovato soluzione ottimale. Status: {pulp.LpStatus[prob.status]}")
+        # diagnostic: collect unsatisfied constraints
+        diagnostics = []
+        for cname, c in prob.constraints.items():
+            try:
+                val = c.value()
+            except Exception:
+                val = None
+            diagnostics.append(f"{cname}: valore residuo {val}")
+        raise ValueError(f"Solver non ha trovato soluzione ottimale. Status: {pulp.LpStatus[prob.status]}. Dettagli: {diagnostics}")
 
     chosen = [i for i in indices if pulp.value(x[i]) >= 0.5]
     portfolio = df.loc[chosen].reset_index(drop=True)
     return portfolio
+
+
+# -----------------------------
+# Sample datasets generator
+# -----------------------------
+
+def generate_sample_datasets() -> Dict[str, pd.DataFrame]:
+    """Return two sample datasets: 'feasible' and 'infeasible' for quick testing/download."""
+    # Base columns: Comparto, ISIN, Issuer, Maturity, Currency, Sector, IssuerType, ScoreRendimento, ScoreRischio
+    rows_feasible = []
+    rows_infeasible = []
+
+    # Feasible: create many unique corporate issuers and enough govts
+    issuers_corp = [f"CorpA{i}" for i in range(1, 21)]
+    issuers_govt = ["GovtA", "GovtB", "GovtC", "GovtD", "GovtE"]
+
+    # create 30 feasible rows
+    i = 1
+    for issuer in issuers_govt:
+        rows_feasible.append({
+            "Comparto": "Fixed Income",
+            "ISIN": f"F-E{i}",
+            "Issuer": issuer,
+            "Maturity": pd.Timestamp.today() + pd.DateOffset(years=5),
+            "Currency": "EUR",
+            "Sector": "Government",
+            "IssuerType": "Govt",
+            "ScoreRendimento": 25 + (i % 5),
+            "ScoreRischio": 30 + (i % 4),
+        })
+        i += 1
+
+    for issuer in issuers_corp:
+        rows_feasible.append({
+            "Comparto": "Fixed Income",
+            "ISIN": f"F-C{i}",
+            "Issuer": issuer,
+            "Maturity": pd.Timestamp.today() + pd.DateOffset(years=(i % 10) + 1),
+            "Currency": "USD" if (i % 2 == 0) else "EUR",
+            "Sector": "Financials" if (i % 3 == 0) else "Non Financials",
+            "IssuerType": "Corporate Retail" if (i % 2 == 0) else "Corporate Istituzionali",
+            "ScoreRendimento": 30 + (i % 7),
+            "ScoreRischio": 40 + (i % 6),
+        })
+        i += 1
+
+    # Infeasible: create too few unique corporate issuers and too few govts
+    issuers_corp_small = ["SmallCorp1", "SmallCorp1", "SmallCorp1", "SmallCorp2", "SmallCorp2"]  # repeats to force uniqueness conflict
+    issuers_govt_small = ["OnlyGov1", "OnlyGov2"]
+    j = 1
+    for issuer in issuers_govt_small:
+        rows_infeasible.append({
+            "Comparto": "Fixed Income",
+            "ISIN": f"I-E{j}",
+            "Issuer": issuer,
+            "Maturity": pd.Timestamp.today() + pd.DateOffset(years=4),
+            "Currency": "EUR",
+            "Sector": "Government",
+            "IssuerType": "Govt",
+            "ScoreRendimento": 22 + j,
+            "ScoreRischio": 35 + j,
+        })
+        j += 1
+
+    k = 1
+    for issuer in issuers_corp_small:
+        rows_infeasible.append({
+            "Comparto": "Fixed Income",
+            "ISIN": f"I-C{k}",
+            "Issuer": issuer,
+            "Maturity": pd.Timestamp.today() + pd.DateOffset(years=(k % 7) + 1),
+            "Currency": "USD",
+            "Sector": "Non Financials",
+            "IssuerType": "Corporate Retail",
+            "ScoreRendimento": 26 + (k % 5),
+            "ScoreRischio": 45 + (k % 4),
+        })
+        k += 1
+
+    df_feasible = pd.DataFrame(rows_feasible)
+    df_infeasible = pd.DataFrame(rows_infeasible)
+    return {"feasible": df_feasible, "infeasible": df_infeasible}
+
 
 # -----------------------------
 # Streamlit UI
@@ -261,6 +414,15 @@ st.title("Bond Portfolio Selector — vincoli hard con MILP")
 uploaded = st.file_uploader("Carica il CSV dei titoli (RepBondPlus o simile)", type=["csv"])
 if not uploaded:
     st.info("Carica un file CSV con le colonne necessarie. Vedi istruzioni nel README.")
+
+# Offer sample datasets for quick testing even before upload
+with st.expander("Dataset di esempio (download)"):
+    samples = generate_sample_datasets()
+    st.write("Scarica due CSV di test: uno con vincoli fattibili e uno con vincoli non fattibili (per provare i messaggi di diagnostica).")
+    st.download_button("Download sample fattibile (CSV)", data=samples["feasible"].to_csv(index=False).encode("utf-8"), file_name="sample_feasible.csv")
+    st.download_button("Download sample non fattibile (CSV)", data=samples["infeasible"].to_csv(index=False).encode("utf-8"), file_name="sample_infeasible.csv")
+
+if not uploaded:
     st.stop()
 
 try:
@@ -318,6 +480,7 @@ with col2:
     else:
         w_mat = {}
 
+
 # validation helper
 def validate_weights(weights: Dict[str, float], label: str):
     if not weights:
@@ -332,6 +495,17 @@ w_val = validate_weights(w_val, "Valuta")
 w_iss = validate_weights(w_iss, "Tipo Emittente")
 w_sec = validate_weights(w_sec, "Settore")
 w_mat = validate_weights(w_mat, "Scadenza")
+
+# Pre-check button to show diagnostics
+if (lock_val or lock_iss or lock_sec or lock_mat):
+    if st.button("Esegui pre-check vincoli"):
+        shortages = precheck_targets(universe, int(n), w_val, w_iss, w_sec, w_mat)
+        if not shortages:
+            st.success("Pre-check completato: tutti i target sembrano raggiungibili (a livello locale).")
+        else:
+            st.error("Pre-check: trovate criticità nei target. Vedi dettaglio sotto.")
+            df_short = pd.DataFrame(shortages)
+            st.dataframe(df_short)
 
 # ensure at least one constraint selected for MILP; if none selected, we will return top-n by score
 if (lock_val or lock_iss or lock_sec or lock_mat) and pulp is None:
