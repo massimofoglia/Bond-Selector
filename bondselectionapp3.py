@@ -43,7 +43,7 @@ REQUIRED_COLS_ALIASES = {
     "ISIN": ["ISIN", "ISIN Code"],
     "Issuer": ["Issuer", "Issuer Name", "Emittente"],
     "Maturity": ["Maturity", "Maturity Date", "Scadenza", "MaturityDate"],
-    "Currency": ["Currency", "ISO Currency", "Valuta"],
+    "Currency": ["Currency", "ISO Currency", "Valuta", "Divisa"],
     "Sector": ["Sector", "Settore Industriale"],
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
     "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRend"],
@@ -599,4 +599,5 @@ if st.button("Costruisci portafoglio (hard)"):
     st.balloons()
 
 # EOF
+
 
