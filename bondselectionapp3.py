@@ -37,7 +37,11 @@ REQUIRED_COLS_ALIASES = {
 }
 
 def load_and_normalize(uploaded_file):
-    df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+    try:
+        df = pd.read_csv(uploaded_file)
+    except UnicodeDecodeError:
+        df = pd.read_excel(uploaded_file)
+
     colmap = {}
     for canon, aliases in REQUIRED_COLS_ALIASES.items():
         for a in aliases:
@@ -181,4 +185,3 @@ if uploaded:
             st.text("\n".join(st.session_state["debug_msgs"]))
 
 # EOF
-
