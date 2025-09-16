@@ -15,6 +15,13 @@ except Exception:
     pulp = None
 
 # -----------------------------
+# Debug helper
+# -----------------------------
+def debug_log(msg):
+    st.session_state.setdefault("debug_msgs", []).append(msg)
+    print(msg)
+    
+# -----------------------------
 # Column aliases and loaders
 # -----------------------------
 REQUIRED_COLS_ALIASES = {
@@ -618,3 +625,4 @@ if st.button("Costruisci portafoglio (hard)"):
     st.balloons()
 
 # EOF
+
