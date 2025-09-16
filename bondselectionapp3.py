@@ -32,7 +32,7 @@ REQUIRED_COLS_ALIASES = {
     "Currency": ["Currency", "ISO Currency", "Valuta"],
     "Sector": ["Sector", "Settore"],
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
-    "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRend"],
+    "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRet"],
     "ScoreRischio": ["ScoreRischio", "Score Risk", "Score Rischio", "ScoreRisk"],
 }
 
@@ -181,3 +181,4 @@ if uploaded:
             st.text("\n".join(st.session_state["debug_msgs"]))
 
 # EOF
+
