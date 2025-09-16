@@ -42,9 +42,9 @@ REQUIRED_COLS_ALIASES = {
     "Comparto": ["Comparto", "Unnamed: 0"],
     "ISIN": ["ISIN", "ISIN Code"],
     "Issuer": ["Issuer", "Issuer Name", "Emittente"],
-    "Maturity": ["Maturity", "Maturity Date", "Scadenza", "MaturityDate"],
-    "Currency": ["Currency", "ISO Currency", "Valuta", "Divisa"],
-    "Sector": ["Sector", "Settore Industriale"],
+    "Maturity": ["Maturity", "Maturity Date", "Scadenza Data", "MaturityDate"],
+    "Currency": ["Currency", "ISO Currency", "Valuta"],
+    "Sector": ["Sector", "Settore"],
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
     "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRend"],
     "ScoreRischio": ["ScoreRischio", "Score Risk", "Score Rischio", "ScoreRisk"],
@@ -268,6 +268,7 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], t
     df = df.reset_index(drop=True).copy()
     indices = list(df.index)
 
+    # create problem and variables
     prob = pulp.LpProblem("bond_selection", pulp.LpMaximize)
     x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
 
@@ -302,20 +303,39 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], t
             idxs = group.index.tolist()
             prob += pulp.lpSum([x[i] for i in idxs]) <= 1
 
-    # solve
+    # solve with robust handling
     solver = pulp.PULP_CBC_CMD(msg=False)
-    res = prob.solve(solver)
+    try:
+        res = prob.solve(solver)
+    except Exception as e:
+        # do not reference 'prob' in this branch if not guaranteed; provide clear message
+        raise RuntimeError(f"Errore nel solver MILP: {e}")
 
-    if pulp.LpStatus[prob.status] != "Optimal":
-        # diagnostic: collect unsatisfied constraints
+    # interpret status safely using the return code 'res'
+    status_str = None
+    try:
+        status_map = getattr(pulp, "LpStatus", None)
+        if isinstance(status_map, dict):
+            status_str = status_map.get(res, str(res))
+        else:
+            # fallback
+            status_str = str(res)
+    except Exception:
+        status_str = str(res)
+
+    if status_str != "Optimal":
+        # diagnostic: collect unsatisfied constraints (if prob exists)
         diagnostics = []
-        for cname, c in prob.constraints.items():
-            try:
-                val = c.value()
-            except Exception:
-                val = None
-            diagnostics.append(f"{cname}: valore residuo {val}")
-        raise ValueError(f"Solver non ha trovato soluzione ottimale. Status: {pulp.LpStatus[prob.status]}. Dettagli: {diagnostics}")
+        try:
+            for cname, c in prob.constraints.items():
+                try:
+                    val = c.value()
+                except Exception:
+                    val = None
+                diagnostics.append(f"{cname}: valore residuo {val}")
+        except Exception:
+            diagnostics = ["Impossibile leggere i vincoli dal modello per diagnostics."]
+        raise ValueError(f"Solver non ha trovato soluzione ottimale. Status: {status_str}. Dettagli: {diagnostics}")
 
     chosen = [i for i in indices if pulp.value(x[i]) >= 0.5]
     portfolio = df.loc[chosen].reset_index(drop=True)
@@ -599,5 +619,3 @@ if st.button("Costruisci portafoglio (hard)"):
     st.balloons()
 
 # EOF
-
-
