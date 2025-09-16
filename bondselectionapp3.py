@@ -46,7 +46,7 @@ REQUIRED_COLS_ALIASES = {
     "Currency": ["Currency", "ISO Currency", "Valuta"],
     "Sector": ["Sector", "Settore"],
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
-    "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRend"],
+    "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRet"],
     "ScoreRischio": ["ScoreRischio", "Score Risk", "Score Rischio", "ScoreRisk"],
 }
 
@@ -619,3 +619,4 @@ if st.button("Costruisci portafoglio (hard)"):
     st.balloons()
 
 # EOF
+
