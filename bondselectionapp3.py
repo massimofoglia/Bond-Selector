@@ -1,24 +1,3 @@
-"""
-Streamlit web app for building a bond portfolio from a CSV using multi-criteria
-filters and target weights. Ready to deploy on Streamlit Community Cloud.
-
-Usage (local):
-  pip install -r requirements.txt
-  streamlit run app.py
-
-Files to include in the repo for deployment (example):
-- app.py                 (this file)
-- requirements.txt      (see bottom of this file for contents)
-- README.md             (optional, with deploy steps)
-
-The app implements the business rules you specified:
-- Keep only bonds with ScoreRendimento >= 20 and either
-  ( Perc_ScoreRendimento > 50% & Perc_ScoreRischio > 90% ) OR
-  ( Perc_ScoreRendimento > 90% & Perc_ScoreRischio > 50% )
-- Select N bonds maximizing ScoreRendimento while minimizing deviations from
-  weighted targets across Currency, IssuerType, Sector, and Maturity buckets.
-"""
-
 import io
 import math
 from dataclasses import dataclass
@@ -181,9 +160,10 @@ def integer_targets_from_weights(n: int, weights: Dict[str, float]) -> Dict[str,
     floor = {k: int(math.floor(v)) for k, v in raw.items()}
     remainder = sorted(((raw[k] - floor[k], k) for k in raw), reverse=True)
     remaining = n - sum(floor.values())
-    for i in range(remaining):
-        _, k = remainder[i]
-        floor[k] += 1
+    if remainder:
+        for i in range(remaining):
+            _, k = remainder[i % len(remainder)]
+            floor[k] += 1
     return floor
 
 
@@ -442,6 +422,24 @@ with st.expander("Dataset di esempio (download)"):
     st.download_button("Download sample fattibile (CSV)", data=samples["feasible"].to_csv(index=False).encode("utf-8"), file_name="sample_feasible.csv")
     st.download_button("Download sample non fattibile (CSV)", data=samples["infeasible"].to_csv(index=False).encode("utf-8"), file_name="sample_infeasible.csv")
 
+    # Quick-run button: esegue automaticamente un test sul sample fattibile
+    st.markdown("---")
+    if st.button("Esegui test automatico (sample fattibile)"):
+        st.info("Eseguo test con n=10 e vincolo Valuta EUR:50, USD:50")
+        sample = samples["feasible"].copy()
+        try:
+            sample = sample.rename(columns={"Currency": "Valuta", "IssuerType": "TipoEmittente", "Sector": "Settore"})
+            sample = load_and_normalize(io.StringIO(sample.to_csv(index=False)))
+            # build with n=10 and EUR:50/ USD:50
+            try:
+                port = build_portfolio_milp(sample, 10, {"EUR": 50.0, "USD": 50.0}, {}, {}, {})
+                st.success("Test completato: portafoglio costruito")
+                st.dataframe(port)
+            except Exception as e:
+                st.error(f"Test fallito: {e}")
+        except Exception as e:
+            st.error(f"Errore preparazione sample: {e}")
+
 if not uploaded:
     st.stop()
 
@@ -619,4 +617,3 @@ if st.button("Costruisci portafoglio (hard)"):
     st.balloons()
 
 # EOF
-
