@@ -15,13 +15,6 @@ except Exception:
     pulp = None
 
 # -----------------------------
-# Debug helper
-# -----------------------------
-def debug_log(msg):
-    st.session_state.setdefault("debug_msgs", []).append(msg)
-    print(msg)
-    
-# -----------------------------
 # Column aliases and loaders
 # -----------------------------
 REQUIRED_COLS_ALIASES = {
@@ -256,7 +249,6 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], t
     indices = list(df.index)
 
     # create problem and variables
-    debug_log("Avvio solver MILP")
     prob = pulp.LpProblem("bond_selection", pulp.LpMaximize)
     x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
 
@@ -625,4 +617,3 @@ if st.button("Costruisci portafoglio (hard)"):
     st.balloons()
 
 # EOF
-
