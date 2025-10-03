@@ -228,76 +228,73 @@ def precheck_targets(df: pd.DataFrame, n: int, targ_val: Dict[str, float], targ_
 # MILP builder (uses PuLP)
 # -----------------------------
 
+def _solve_milp_problem(prob, solver):
+    """
+    Isolates the solver call in a separate function to prevent scoping errors
+    during exception handling, which was causing the 'UnboundLocalError'.
+    """
+    try:
+        prob.solve(solver)
+        return prob.status
+    except Exception as e:
+        # If the solver itself crashes, we catch the error here and raise a new,
+        # clean exception that doesn't have scoping issues.
+        raise RuntimeError(f"Il risolutore PuLP ha riscontrato un errore critico: {str(e)}")
+
+
 def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], targ_iss: Dict[str, float], targ_sec: Dict[str, float], targ_mat: Dict[str, float]) -> pd.DataFrame:
-    """
-    Costruisce un portafoglio ottimizzato usando la programmazione lineare intera (MILP).
-    La funzione è stata riscritta per gestire in modo robusto gli errori di PuLP.
-    """
     if pulp is None:
         raise RuntimeError("La libreria PuLP non è installata. Esegui: pip install pulp")
 
-    # --- Fase 1: Validazione preliminare dei dati ---
-    # Questo controllo previene l'avvio di un'ottimizzazione impossibile.
+    # 1. Validazione preliminare
     shortages = precheck_targets(df, n, targ_val, targ_iss, targ_sec, targ_mat)
     if shortages:
         lines = [f"{s['dim']}='{s['category']}': richiesti={s['required']}, disponibili={s.get('available',0)}, max_possibili={s.get('max_possible',0)}" for s in shortages]
-        raise ValueError("Vincoli impossibili da soddisfare (rilevato dal pre-check). Dettagli: " + "; ".join(lines))
+        raise ValueError("Vincoli impossibili da soddisfare (rilevato dal pre-check): " + "; ".join(lines))
 
-    # --- Fase 2: Costruzione e risoluzione del problema in un unico blocco sicuro ---
-    try:
-        # Inizializzazione del problema
-        prob = pulp.LpProblem("bond_selection", pulp.LpMaximize)
+    # 2. Costruzione del problema
+    prob = pulp.LpProblem("bond_selection", pulp.LpMaximize)
+    df_copy = df.reset_index(drop=True).copy()
+    indices = list(df_copy.index)
+    x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
+    
+    t_val = integer_targets_from_weights(n, targ_val)
+    t_iss = integer_targets_from_weights(n, targ_iss)
+    t_sec = integer_targets_from_weights(n, targ_sec)
+    t_mat = integer_targets_from_weights(n, targ_mat)
 
-        # Preparazione dati e variabili
-        df_copy = df.reset_index(drop=True).copy()
-        indices = list(df_copy.index)
-        x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
-        
-        # Calcolo dei target numerici
-        t_val = integer_targets_from_weights(n, targ_val)
-        t_iss = integer_targets_from_weights(n, targ_iss)
-        t_sec = integer_targets_from_weights(n, targ_sec)
-        t_mat = integer_targets_from_weights(n, targ_mat)
+    scores = df_copy["ScoreRendimento"].fillna(0).astype(float).to_dict()
+    prob += pulp.lpSum([scores[i] * x[i] for i in indices])
+    prob += pulp.lpSum([x[i] for i in indices]) == n
 
-        # Aggiunta della funzione obiettivo e dei vincoli
-        scores = df_copy["ScoreRendimento"].fillna(0).astype(float).to_dict()
-        prob += pulp.lpSum([scores[i] * x[i] for i in indices]), "Maximize_Score"
-        prob += pulp.lpSum([x[i] for i in indices]) == n, "Total_Number_of_Bonds"
+    def add_equal_constraints(mapping: Dict[str, int], col: str):
+        for cat, cnt in mapping.items():
+            idxs = [i for i, v in df_copy[col].astype(str).items() if v == str(cat)]
+            prob += pulp.lpSum([x[i] for i in idxs]) == cnt
 
-        def add_equal_constraints(mapping: Dict[str, int], col: str, prefix: str):
-            for cat, cnt in mapping.items():
-                idxs = [i for i, v in df_copy[col].astype(str).items() if v == str(cat)]
-                prob += pulp.lpSum([x[i] for i in idxs]) == cnt, f"Constraint_{prefix}_{cat}"
+    if t_val: add_equal_constraints(t_val, "Valuta")
+    if t_iss: add_equal_constraints(t_iss, "TipoEmittente")
+    if t_sec: add_equal_constraints(t_sec, "Settore")
+    if t_mat: add_equal_constraints(t_mat, "Scadenza")
+    
+    corp_mask = df_copy["TipoEmittente"].str.contains("Corp", case=False, na=False) | df_copy["TipoEmittente"].str.contains("Corporate", case=False, na=False)
+    corp_df = df_copy[corp_mask]
+    if not corp_df.empty:
+        for issuer, group in corp_df.groupby("Issuer"):
+            idxs = group.index.tolist()
+            prob += pulp.lpSum([x[i] for i in idxs]) <= 1
 
-        if t_val: add_equal_constraints(t_val, "Valuta", "Valuta")
-        if t_iss: add_equal_constraints(t_iss, "TipoEmittente", "IssuerType")
-        if t_sec: add_equal_constraints(t_sec, "Settore", "Sector")
-        if t_mat: add_equal_constraints(t_mat, "Scadenza", "Maturity")
-        
-        corp_mask = df_copy["TipoEmittente"].str.contains("Corp", case=False, na=False) | df_copy["TipoEmittente"].str.contains("Corporate", case=False, na=False)
-        corp_df = df_copy[corp_mask]
-        if not corp_df.empty:
-            for issuer, group in corp_df.groupby("Issuer"):
-                idxs = group.index.tolist()
-                prob += pulp.lpSum([x[i] for i in idxs]) <= 1, f"Unique_Corp_{issuer}"
+    # 3. Risoluzione isolata e analisi del risultato
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    status_code = _solve_milp_problem(prob, solver)
+    
+    status = pulp.LpStatus[status_code]
+    if status == "Optimal":
+        chosen_indices = [i for i in indices if x[i].varValue is not None and x[i].varValue > 0.5]
+        return df_copy.loc[chosen_indices].reset_index(drop=True)
+    else:
+        raise ValueError(f"Il risolutore non ha trovato una soluzione ottimale. Stato restituito: '{status}'. Questo indica che i vincoli sono in conflitto e non possono essere soddisfatti simultaneamente.")
 
-        # Risoluzione del problema
-        solver = pulp.PULP_CBC_CMD(msg=False)
-        prob.solve(solver)
-
-        # Analisi del risultato
-        status = pulp.LpStatus[prob.status]
-        if status == "Optimal":
-            chosen_indices = [i for i in indices if x[i].varValue is not None and x[i].varValue > 0.5]
-            return df_copy.loc[chosen_indices].reset_index(drop=True)
-        else:
-            # Se la soluzione non è ottimale, restituisce un errore chiaro.
-            raise ValueError(f"Il risolutore non ha trovato una soluzione ottimale. Stato: '{status}'. Questo solitamente indica vincoli in conflitto tra loro.")
-
-    except Exception as e:
-        # Questo blocco cattura qualsiasi errore avvenuto durante la costruzione o risoluzione
-        # e restituisce un messaggio di errore pulito, senza causare un crash.
-        raise RuntimeError(f"Si è verificato un errore imprevisto nel motore di ottimizzazione. Causa: {type(e).__name__} - {str(e)}")
 
 # -----------------------------
 # Sample datasets generator
@@ -594,7 +591,3 @@ if st.button("Costruisci portafoglio (hard)"):
     st.balloons()
 
 # EOF
-
-
-
-
