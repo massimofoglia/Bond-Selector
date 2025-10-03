@@ -130,7 +130,6 @@ def precheck_targets(df: pd.DataFrame, n: int, **targets) -> List[Dict[str, obje
 def _solve_and_get_status(prob, solver):
     """
     Funzione isolata per eseguire il solve e prevenire l'errore 'UnboundLocalError'.
-    Questo è il cuore della correzione.
     """
     try:
         prob.solve(solver)
@@ -238,7 +237,8 @@ if uploaded:
             
             with st.spinner("Ottimizzazione in corso..."):
                 try:
-                    if not any([w_val, w_iss, w_sec, w_mat]):
+                    has_constraints = any([w_val, w_iss, w_sec, w_mat])
+                    if not has_constraints:
                         st.info("Nessun vincolo specificato. Seleziono i migliori N titoli per Score Rendimento.")
                         portfolio = universe.nlargest(n, "ScoreRendimento").reset_index(drop=True)
                     else:
@@ -249,6 +249,48 @@ if uploaded:
                     
                     csv = portfolio.to_csv(index=False).encode('utf-8')
                     st.download_button("Scarica Portafoglio (CSV)", data=csv, file_name="portafoglio_ottimizzato.csv")
+                    
+                    # --- SEZIONE GRAFICI E CONFRONTO ---
+                    if has_constraints:
+                        st.header("Confronto Target vs Effettivo")
+                        
+                        def compute_dist(df_port, col):
+                            return (df_port[col].value_counts(normalize=True) * 100).round(1)
+
+                        distr = {
+                            "Valuta": (w_val, compute_dist(portfolio, "Valuta")),
+                            "TipoEmittente": (w_iss, compute_dist(portfolio, "TipoEmittente")),
+                            "Settore": (w_sec, compute_dist(portfolio, "Settore")),
+                            "Scadenza": (w_mat, compute_dist(portfolio, "Scadenza")),
+                        }
+
+                        for crit, (target, actual) in distr.items():
+                            if not target: continue
+                            st.subheader(crit)
+                            cats = sorted(set(list(target.keys())) | set(actual.index.astype(str)))
+                            rows = []
+                            for c in cats:
+                                tgt_val = target.get(c, 0.0)
+                                act_val = float(actual.get(c, 0.0))
+                                rows.append({crit: c, "Target %": f"{tgt_val:.1f}", "Effettivo %": f"{act_val:.1f}"})
+                            df_table = pd.DataFrame(rows)
+                            st.dataframe(df_table)
+
+                            # Grafico a barre
+                            fig, ax = plt.subplots()
+                            x = np.arange(len(cats))
+                            width = 0.35
+                            ax.bar(x - width/2, [float(r["Effettivo %"]) for r in rows], width, label="Effettivo")
+                            ax.bar(x + width/2, [float(r["Target %"]) for r in rows], width, label="Target")
+                            ax.set_ylabel("Percentuale (%)")
+                            ax.set_title(f'Confronto per {crit}')
+                            ax.set_xticks(x)
+                            ax.set_xticklabels(cats, rotation=45, ha="right")
+                            ax.legend()
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                    
+                    st.balloons()
 
                 except (ValueError, RuntimeError) as e:
                     st.error(f"Impossibile costruire il portafoglio: {e}")
