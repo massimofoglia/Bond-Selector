@@ -230,42 +230,35 @@ def precheck_targets(df: pd.DataFrame, n: int, targ_val: Dict[str, float], targ_
 
 def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], targ_iss: Dict[str, float], targ_sec: Dict[str, float], targ_mat: Dict[str, float]) -> pd.DataFrame:
     if pulp is None:
-        raise RuntimeError("PuLP non è installato. Esegui: pip install pulp")
+        raise RuntimeError("La libreria PuLP non è installata. Esegui: pip install pulp")
 
-    # Eseguiamo il pre-check dei vincoli prima di costruire il problema.
-    # Questo ci permette di fallire rapidamente se i dati non supportano i vincoli.
+    # 1. Pre-check per identificare subito vincoli impossibili
     shortages = precheck_targets(df, n, targ_val, targ_iss, targ_sec, targ_mat)
     if shortages:
         lines = [f"{s['dim']}='{s['category']}': richiesti={s['required']}, disponibili={s.get('available',0)}, max_possibili={s.get('max_possible',0)}" for s in shortages]
         raise ValueError("Vincoli impossibili da soddisfare (rilevato dal pre-check). Dettagli: " + "; ".join(lines))
 
-    # Inizializziamo il problema. Tutto il resto avverrà in un blocco try-except
-    # per catturare qualsiasi errore durante la costruzione o la risoluzione.
+    # Inizializzazione del problema di ottimizzazione
     prob = pulp.LpProblem("bond_selection", pulp.LpMaximize)
-
+    
+    # 2. Costruzione del problema dentro un blocco try-except per massima sicurezza
     try:
-        # Calcolo dei target interi
         t_val = integer_targets_from_weights(n, targ_val)
         t_iss = integer_targets_from_weights(n, targ_iss)
         t_sec = integer_targets_from_weights(n, targ_sec)
         t_mat = integer_targets_from_weights(n, targ_mat)
 
-        # Preparazione dei dati e delle variabili del problema
-        df = df.reset_index(drop=True).copy()
-        indices = list(df.index)
+        df_copy = df.reset_index(drop=True).copy()
+        indices = list(df_copy.index)
         x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
 
-        # Funzione obiettivo: massimizzare lo ScoreRendimento
-        scores = df["ScoreRendimento"].fillna(0).astype(float).to_dict()
+        scores = df_copy["ScoreRendimento"].fillna(0).astype(float).to_dict()
         prob += pulp.lpSum([scores[i] * x[i] for i in indices])
-
-        # Vincolo sul numero totale di titoli
         prob += pulp.lpSum([x[i] for i in indices]) == n
 
-        # Aggiunta dei vincoli di categoria (Valuta, Tipo Emittente, ecc.)
         def add_equal_constraints(mapping: Dict[str, int], col: str):
             for cat, cnt in mapping.items():
-                idxs = [i for i, v in df[col].astype(str).items() if v == str(cat)]
+                idxs = [i for i, v in df_copy[col].astype(str).items() if v == str(cat)]
                 prob += pulp.lpSum([x[i] for i in idxs]) == cnt
 
         if t_val: add_equal_constraints(t_val, "Valuta")
@@ -273,38 +266,45 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], t
         if t_sec: add_equal_constraints(t_sec, "Settore")
         if t_mat: add_equal_constraints(t_mat, "Scadenza")
 
-        # Vincolo di unicità per gli emittenti Corporate
-        corporate_mask = df["TipoEmittente"].str.contains("Corp", case=False, na=False) | df["TipoEmittente"].str.contains("Corporate", case=False, na=False)
-        corp_df = df[corporate_mask]
+        corp_mask = df_copy["TipoEmittente"].str.contains("Corp", case=False, na=False) | df_copy["TipoEmittente"].str.contains("Corporate", case=False, na=False)
+        corp_df = df_copy[corp_mask]
         if not corp_df.empty:
             for issuer, group in corp_df.groupby("Issuer"):
                 idxs = group.index.tolist()
                 prob += pulp.lpSum([x[i] for i in idxs]) <= 1
 
-        # --- Risoluzione del problema ---
+    except Exception as e:
+        # Se c'è un errore durante la costruzione del problema, lo segnaliamo
+        raise RuntimeError(f"Errore durante la costruzione del modello di ottimizzazione: {type(e).__name__} - {e}")
+
+    # 3. Risoluzione del problema e gestione sicura degli errori
+    try:
         solver = pulp.PULP_CBC_CMD(msg=False)
         prob.solve(solver)
-
-        # --- Controllo dello stato della soluzione e estrazione dei risultati ---
-        if pulp.LpStatus[prob.status] == "Optimal":
-            chosen = [i for i in indices if x[i].varValue >= 0.5]
-            if len(chosen) != n:
-                # Questo è un controllo di sicurezza aggiuntivo
-                raise RuntimeError(f"Errore di consistenza: il solver ha restituito una soluzione ottimale ma il numero di titoli ({len(chosen)}) non corrisponde a quello richiesto ({n}).")
-            portfolio = df.loc[chosen].reset_index(drop=True)
-            return portfolio
+        
+        status = pulp.LpStatus[prob.status]
+        if status == "Optimal":
+            chosen_indices = [i for i in indices if x[i].varValue is not None and x[i].varValue > 0.5]
+            return df_copy.loc[chosen_indices].reset_index(drop=True)
         else:
-            # Se la soluzione non è ottimale, solleviamo un errore chiaro con lo stato restituito.
-            status_str = pulp.LpStatus[prob.status]
-            raise ValueError(f"Il solver non ha trovato una soluzione ottimale. Stato restituito: '{status_str}'. Ciò accade quando i vincoli sono in conflitto tra loro e non possono essere soddisfatti simultaneamente.")
-
-    except ValueError as ve:
-        # Rilanciamo gli errori di tipo ValueError (dal pre-check o dalla soluzione non ottimale)
-        raise ve
+            # Se la soluzione non è ottimale, forniamo un feedback chiaro
+            raise ValueError(f"Il risolutore non ha trovato una soluzione ottimale. Stato: '{status}'. Questo solitamente indica vincoli in conflitto tra loro.")
+            
     except Exception as e:
-        # Catturiamo qualsiasi altra eccezione imprevista durante il processo
-        # Questo messaggio generico previene il crash e fornisce contesto.
-        raise RuntimeError(f"Si è verificato un errore imprevisto durante la costruzione o la risoluzione del problema MILP: {e}")
+        # Questo blocco cattura errori direttamente dal risolutore
+        # ed evita il crash stampando solo informazioni sicure.
+        error_type = type(e).__name__
+        error_msg = str(e)
+        
+        # L'errore originale "cannot access local variable..." non verrà più mostrato.
+        # Al suo posto, un messaggio più stabile e informativo.
+        final_msg = f"Si è verificato un errore critico durante l'esecuzione del risolutore MILP. Tipo di Errore: {error_type}."
+        if "ValueError" in error_type or "RuntimeError" in error_type:
+            final_msg += f" Dettaglio: {error_msg}"
+        else:
+            final_msg += " Questo potrebbe essere causato da un'installazione incompleta di PuLP o da dati non validi."
+            
+        raise RuntimeError(final_msg)
 
 # -----------------------------
 # Sample datasets generator
@@ -601,5 +601,6 @@ if st.button("Costruisci portafoglio (hard)"):
     st.balloons()
 
 # EOF
+
 
 
