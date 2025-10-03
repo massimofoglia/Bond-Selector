@@ -285,37 +285,34 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val: Dict[str, float], t
 
     # solve with robust handling
     solver = pulp.PULP_CBC_CMD(msg=False)
+    status_str = ""
     try:
         res = prob.solve(solver)
-    except Exception as e:
-        # do not reference 'prob' in this branch if not guaranteed; provide clear message
-        raise RuntimeError(f"Errore nel solver MILP: {e}")
-
-    # interpret status safely using the return code 'res'
-    status_str = None
-    try:
+        # interpret status safely using the return code 'res'
         status_map = getattr(pulp, "LpStatus", None)
         if isinstance(status_map, dict):
             status_str = status_map.get(res, str(res))
         else:
             # fallback
             status_str = str(res)
-    except Exception:
-        status_str = str(res)
 
-    if status_str != "Optimal":
-        # diagnostic: collect unsatisfied constraints (if prob exists)
-        diagnostics = []
-        try:
-            for cname, c in prob.constraints.items():
-                try:
-                    val = c.value()
-                except Exception:
-                    val = None
-                diagnostics.append(f"{cname}: valore residuo {val}")
-        except Exception:
-            diagnostics = ["Impossibile leggere i vincoli dal modello per diagnostics."]
-        raise ValueError(f"Solver non ha trovato soluzione ottimale. Status: {status_str}. Dettagli: {diagnostics}")
+        if status_str != "Optimal":
+            # diagnostic: collect unsatisfied constraints
+            diagnostics = []
+            try:
+                for cname, c in prob.constraints.items():
+                    try:
+                        val = c.value()
+                    except Exception:
+                        val = None
+                    diagnostics.append(f"{cname}: valore residuo {val}")
+            except Exception:
+                diagnostics = ["Impossibile leggere i vincoli dal modello per diagnostics."]
+            raise ValueError(f"Solver non ha trovato soluzione ottimale. Status: {status_str}. Dettagli: {diagnostics}")
+
+    except Exception as e:
+        # do not reference 'prob' in this branch if not guaranteed; provide clear message
+        raise RuntimeError(f"Errore nel solver MILP: {e}")
 
     chosen = [i for i in indices if pulp.value(x[i]) >= 0.5]
     portfolio = df.loc[chosen].reset_index(drop=True)
