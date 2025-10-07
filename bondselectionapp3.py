@@ -128,9 +128,6 @@ def precheck_targets(df: pd.DataFrame, n: int, **targets) -> List[Dict[str, obje
     return shortages
 
 def _solve_and_get_status(prob, solver):
-    """
-    Funzione isolata per eseguire il solve e prevenire l'errore 'UnboundLocalError'.
-    """
     try:
         prob.solve(solver)
         return prob.status
@@ -151,9 +148,8 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     indices = list(df_copy.index)
     x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
     
-    # --- LOGICA DI PONDERAZIONE PER LA SELEZIONE ---
     scores = df_copy["ScoreRendimento"].fillna(0).to_dict()
-    weights = {i: 1.0 for i in indices}  # Default: Equally Weighted
+    weights = {i: 1.0 for i in indices}
 
     if weighting_scheme == "Risk Weighted":
         risk_scores = df_copy["ScoreRischio"].fillna(0)
@@ -162,14 +158,9 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
             weights = {i: min(2.0, risk_scores.get(i, 0) / avg_risk_score) for i in indices}
 
     prob += pulp.lpSum(scores[i] * weights[i] * x[i] for i in indices)
-    # --- FINE LOGICA DI PONDERAZIONE ---
-    
     prob += pulp.lpSum(x[i] for i in indices) == n
 
-    targets = {
-        "Valuta": targ_val, "TipoEmittente": targ_iss,
-        "Settore": targ_sec, "Scadenza": targ_mat
-    }
+    targets = {"Valuta": targ_val, "TipoEmittente": targ_iss, "Settore": targ_sec, "Scadenza": targ_mat}
     for col, weights_map in targets.items():
         if not weights_map: continue
         for cat, count in integer_targets_from_weights(n, weights_map).items():
@@ -189,6 +180,55 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     else:
         raise ValueError(f"Il risolutore non ha trovato una soluzione ottimale. Stato: '{status}'. Questo indica che i vincoli sono in conflitto.")
 
+def calculate_final_weights(portfolio: pd.DataFrame, weighting_scheme: str, w_mat, w_sec, w_iss, w_val) -> pd.DataFrame:
+    if portfolio.empty:
+        return portfolio
+
+    portfolio['Peso (%)'] = 0.0
+    
+    # Gerarchia dei vincoli per la ponderazione
+    constraint_hierarchy = [
+        ("Scadenza", w_mat), ("Settore", w_sec),
+        ("TipoEmittente", w_iss), ("Valuta", w_val)
+    ]
+    
+    active_constraint_dim = None
+    active_constraint_targets = None
+    for col, targets in constraint_hierarchy:
+        if targets:
+            active_constraint_dim = col
+            active_constraint_targets = targets
+            break # Usa il primo vincolo attivo nella gerarchia
+
+    # Se ci sono vincoli attivi, pesa all'interno dei comparti
+    if active_constraint_dim:
+        for category, target_weight in active_constraint_targets.items():
+            mask = portfolio[active_constraint_dim] == category
+            portfolio_slice = portfolio[mask]
+            
+            if not portfolio_slice.empty:
+                if weighting_scheme == 'Risk Weighted':
+                    total_risk_slice = portfolio_slice['ScoreRischio'].sum()
+                    if total_risk_slice > 0:
+                        slice_weights = (portfolio_slice['ScoreRischio'] / total_risk_slice) * target_weight
+                        portfolio.loc[mask, 'Peso (%)'] = slice_weights
+                    else: # Fallback a equal weight nel comparto
+                        portfolio.loc[mask, 'Peso (%)'] = target_weight / len(portfolio_slice)
+                else: # Equally Weighted nel comparto
+                    portfolio.loc[mask, 'Peso (%)'] = target_weight / len(portfolio_slice)
+    # Se non ci sono vincoli, pesa sull'intero portafoglio
+    else:
+        if weighting_scheme == 'Risk Weighted':
+            total_risk_portfolio = portfolio['ScoreRischio'].sum()
+            if total_risk_portfolio > 0:
+                portfolio['Peso (%)'] = (portfolio['ScoreRischio'] / total_risk_portfolio) * 100
+            else: # Fallback
+                portfolio['Peso (%)'] = 100 / len(portfolio)
+        else: # Equally Weighted
+            portfolio['Peso (%)'] = 100 / len(portfolio)
+
+    return portfolio
+
 st.set_page_config(page_title="Bond Portfolio Selector", layout="wide")
 st.title("Bond Portfolio Selector — Ottimizzazione con Vincoli")
 
@@ -203,12 +243,12 @@ if uploaded:
         n = st.sidebar.number_input("Numero di titoli (n)", min_value=1, max_value=len(df), value=min(20, len(df)))
 
         st.sidebar.markdown("---")
-        st.sidebar.subheader("Schema di Ponderazione Obiettivo")
+        st.sidebar.subheader("Schema di Ponderazione")
         weighting_scheme = st.sidebar.radio(
-            "Scegli come ponderare i titoli nella selezione:",
+            "Scegli come allocare il capitale nel portafoglio finale:",
             ("Equally Weighted", "Risk Weighted"),
             key="weighting_scheme",
-            help="**Equally Weighted**: Massimizza solo lo ScoreRendimento. **Risk Weighted**: Massimizza una combinazione di ScoreRendimento e ScoreRischio (favorendo i titoli con ScoreRischio più alto)."
+            help="**Equally Weighted**: I titoli selezionati hanno lo stesso peso. **Risk Weighted**: I titoli selezionati sono pesati in base al loro ScoreRischio."
         )
 
         st.sidebar.markdown("---")
@@ -244,12 +284,15 @@ if uploaded:
                 return False, {}
             return True, {k: v for k, v in weights.items() if v > 0}
 
-        is_valid = True
         is_valid_val, w_val = validate_weights(w_val, "Valuta")
         is_valid_iss, w_iss = validate_weights(w_iss, "Tipo Emittente")
         is_valid_sec, w_sec = validate_weights(w_sec, "Settore")
         is_valid_mat, w_mat = validate_weights(w_mat, "Scadenza")
         is_valid = all([is_valid_val, is_valid_iss, is_valid_sec, is_valid_mat])
+
+        active_constraints = [name for name, weights in [('Scadenza', w_mat), ('Settore', w_sec), ('Tipo Emittente', w_iss), ('Valuta', w_val)] if weights]
+        if weighting_scheme == 'Risk Weighted' and len(active_constraints) > 1:
+            st.warning(f"Hai attivato più vincoli con ponderazione a rischio. I pesi finali saranno calcolati usando solo il primo vincolo nella gerarchia: Scadenza > Settore > Tipo Emittente > Valuta.")
 
         if st.button("Costruisci Portafoglio"):
             if not is_valid:
@@ -258,40 +301,26 @@ if uploaded:
             with st.spinner("Ottimizzazione in corso..."):
                 try:
                     has_constraints = any([w_val, w_iss, w_sec, w_mat])
-                    if not has_constraints and weighting_scheme == "Equally Weighted":
-                        st.info("Nessun vincolo specificato e schema Equally Weighted. Seleziono i migliori N titoli per Score Rendimento.")
-                        portfolio = universe.nlargest(n, "ScoreRendimento").reset_index(drop=True)
-                    else:
-                        portfolio = build_portfolio_milp(universe, n, w_val, w_iss, w_sec, w_mat, weighting_scheme)
+                    
+                    # La selezione dei titoli usa sempre lo schema EW/RW definito nella sidebar
+                    portfolio_selection = build_portfolio_milp(universe, n, w_val, w_iss, w_sec, w_mat, weighting_scheme)
 
                     st.success("Portafoglio generato con successo!")
 
-                    # --- NUOVA SEZIONE: CALCOLO PESI E GRAFICO A TORTA ---
-                    if not portfolio.empty:
-                        # Calcola i pesi finali del portafoglio per la visualizzazione
-                        if weighting_scheme == "Risk Weighted":
-                            total_risk_score = portfolio['ScoreRischio'].sum()
-                            if total_risk_score > 0:
-                                portfolio['Peso (%)'] = (portfolio['ScoreRischio'] / total_risk_score) * 100
-                            else:
-                                portfolio['Peso (%)'] = 100 / len(portfolio) # Fallback a equal weight
-                        else: # Equally Weighted
-                            portfolio['Peso (%)'] = 100 / len(portfolio)
-                        
-                        portfolio['Peso (%)'] = portfolio['Peso (%)'].round(2)
-                        
-                        # Sposta la colonna 'Peso (%)' all'inizio per una migliore visibilità
-                        cols_order = ['Peso (%)'] + [col for col in portfolio.columns if col != 'Peso (%)']
-                        portfolio = portfolio[cols_order]
+                    # Calcola i pesi finali per la visualizzazione e il CSV
+                    portfolio = calculate_final_weights(portfolio_selection, weighting_scheme, w_mat, w_sec, w_iss, w_val)
+                    portfolio['Peso (%)'] = portfolio['Peso (%)'].round(2)
+                    
+                    cols_order = ['Peso (%)'] + [col for col in portfolio.columns if col != 'Peso (%)']
+                    portfolio = portfolio[cols_order]
 
-                        st.dataframe(portfolio)
-                        
-                        st.subheader("Distribuzione Pesi del Portafoglio")
-                        fig_pie, ax_pie = plt.subplots()
-                        ax_pie.pie(portfolio['Peso (%)'], labels=portfolio['ISIN'], autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8})
-                        ax_pie.axis('equal')
-                        st.pyplot(fig_pie)
-                    # --- FINE NUOVA SEZIONE ---
+                    st.dataframe(portfolio)
+                    
+                    st.subheader("Distribuzione Pesi del Portafoglio")
+                    fig_pie, ax_pie = plt.subplots()
+                    ax_pie.pie(portfolio['Peso (%)'], labels=portfolio['ISIN'], autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8})
+                    ax_pie.axis('equal')
+                    st.pyplot(fig_pie)
 
                     csv = portfolio.to_csv(index=False).encode('utf-8')
                     st.download_button("Scarica Portafoglio (CSV)", data=csv, file_name="portafoglio_ottimizzato.csv")
@@ -299,8 +328,8 @@ if uploaded:
                     if has_constraints:
                         st.header("Confronto Target vs Effettivo")
                         
-                        def compute_dist(df_port, col):
-                            return (df_port[col].value_counts(normalize=True) * 100).round(1)
+                        # Funzione di calcolo pesi effettivi CORRETTA
+                        compute_dist = lambda df_port, col: df_port.groupby(col)['Peso (%)'].sum()
 
                         distr = {
                             "Valuta": (w_val, compute_dist(portfolio, "Valuta")),
