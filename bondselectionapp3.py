@@ -27,6 +27,10 @@ REQUIRED_COLS_ALIASES = {
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
     "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRet"],
     "ScoreRischio": ["ScoreRischio", "Score Risk", "Score Rischio", "ScoreRisk"],
+    "MarketPrice": ["MarketPrice", "Market Price", "Prezzo Mercato", "PrezzoDirty"],
+    "AccruedInterest": ["AccruedInterest", "Accrued Interest", "Rateo"],
+    "DenominationMinimum": ["DenominationMinimum", "Denomination Minimum", "Lotto Minimo"],
+    "DenominationIncrement": ["DenominationIncrement", "Denomination Increment", "Lotto Incremento"],
 }
 
 def _read_csv_any(uploaded) -> pd.DataFrame:
@@ -48,18 +52,19 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     rename_map = {a: std for std, aliases in REQUIRED_COLS_ALIASES.items() for a in aliases if a in df.columns}
     df = df.rename(columns=rename_map)
 
-    required = ["Comparto", "ISIN", "Issuer", "Maturity", "Currency", "ScoreRendimento", "ScoreRischio"]
-    if not all(c in df.columns for c in required):
-        raise ValueError(f"Colonne obbligatorie mancanti. Trovate: {list(df.columns)}, Richieste: {required}")
+    required = ["ISIN", "Issuer", "Maturity", "Currency", "ScoreRendimento", "ScoreRischio", 
+                "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Colonne obbligatorie mancanti: {', '.join(missing_cols)}")
 
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
-    for col in ["ScoreRendimento", "ScoreRischio"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["ScoreRendimento", "ScoreRischio", "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]:
+        df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
 
-    if "IssuerType" not in df.columns:
-        df["IssuerType"] = df["Comparto"].astype(str).map(_infer_issuer_type)
-    if "Sector" not in df.columns:
-        df["Sector"] = np.where(df["IssuerType"].str.contains("Govt", case=False, na=False), "Government", "Unknown")
+
+    if "IssuerType" not in df.columns: df["IssuerType"] = df.get("Comparto", pd.Series(dtype=str)).astype(str).map(_infer_issuer_type)
+    if "Sector" not in df.columns: df["Sector"] = np.where(df["IssuerType"].str.contains("Govt", case=False, na=False), "Government", "Unknown")
 
     df = df.rename(columns={"Currency": "Valuta", "IssuerType": "TipoEmittente", "Sector": "Settore"})
 
@@ -69,10 +74,9 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     df["Settore"] = df["Settore"].apply(_map_sector)
 
     for c in ["Valuta", "TipoEmittente", "Settore", "Scadenza", "Issuer"]:
-        if c in df.columns:
-            df[c] = df[c].fillna("Unknown").astype(str)
+        if c in df.columns: df[c] = df[c].fillna("Unknown").astype(str)
 
-    return df.dropna(subset=["ScoreRendimento", "ScoreRischio"]).reset_index(drop=True)
+    return df.dropna(subset=required).reset_index(drop=True)
 
 def _infer_issuer_type(comparto: str) -> str:
     s = str(comparto).lower()
@@ -101,32 +105,6 @@ def integer_targets_from_weights(n: int, weights: Dict[str, float]) -> Dict[str,
         floor[k] += 1
     return floor
 
-def precheck_targets(df: pd.DataFrame, n: int, **targets) -> List[Dict[str, object]]:
-    target_map = {
-        "Valuta": targets.get("targ_val", {}),
-        "TipoEmittente": targets.get("targ_iss", {}),
-        "Settore": targets.get("targ_sec", {}),
-        "Scadenza": targets.get("targ_mat", {}),
-    }
-    shortages = []
-    for col, weights in target_map.items():
-        if not weights: continue
-        int_targets = integer_targets_from_weights(n, weights)
-        for cat, req in int_targets.items():
-            mask = df[col] == str(cat)
-            sub = df[mask]
-            if sub.empty:
-                shortages.append({"dim": col, "category": cat, "required": req, "available": 0, "max_possible": 0})
-                continue
-            
-            is_corp = sub["TipoEmittente"].str.contains("Corp", case=False, na=False)
-            gov_count = (~is_corp).sum()
-            unique_corp_issuers = sub[is_corp]["Issuer"].nunique()
-            max_possible = gov_count + unique_corp_issuers
-            if req > max_possible:
-                shortages.append({"dim": col, "category": cat, "required": req, "available": len(sub), "max_possible": max_possible})
-    return shortages
-
 def _solve_and_get_status(prob, solver):
     try:
         prob.solve(solver)
@@ -135,13 +113,7 @@ def _solve_and_get_status(prob, solver):
         raise RuntimeError(f"Il risolutore MILP ha generato un errore critico: {e}")
 
 def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec, targ_mat, weighting_scheme: str) -> pd.DataFrame:
-    if pulp is None:
-        raise RuntimeError("La libreria PuLP non è installata. Esegui: pip install pulp")
-
-    shortages = precheck_targets(df, n, targ_val=targ_val, targ_iss=targ_iss, targ_sec=targ_sec, targ_mat=targ_mat)
-    if shortages:
-        details = "; ".join([f"{s['dim']} '{s['category']}': richiesti {s['required']}, max ottenibili {s['max_possible']}" for s in shortages])
-        raise ValueError(f"Vincoli impossibili da soddisfare. Dettagli: {details}")
+    if pulp is None: raise RuntimeError("La libreria PuLP non è installata. Esegui: pip install pulp")
 
     prob = pulp.LpProblem("bond_selection", pulp.LpMaximize)
     df_copy = df.reset_index(drop=True)
@@ -150,12 +122,10 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     
     scores = df_copy["ScoreRendimento"].fillna(0).to_dict()
     weights = {i: 1.0 for i in indices}
-
     if weighting_scheme == "Risk Weighted":
         risk_scores = df_copy["ScoreRischio"].fillna(0)
         avg_risk_score = risk_scores.mean()
-        if avg_risk_score > 0:
-            weights = {i: min(2.0, risk_scores.get(i, 0) / avg_risk_score) for i in indices}
+        if avg_risk_score > 0: weights = {i: min(2.0, risk_scores.get(i, 0) / avg_risk_score) for i in indices}
 
     prob += pulp.lpSum(scores[i] * weights[i] * x[i] for i in indices)
     prob += pulp.lpSum(x[i] for i in indices) == n
@@ -180,54 +150,66 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     else:
         raise ValueError(f"Il risolutore non ha trovato una soluzione ottimale. Stato: '{status}'. Questo indica che i vincoli sono in conflitto.")
 
-def calculate_final_weights(portfolio: pd.DataFrame, weighting_scheme: str, w_mat, w_sec, w_iss, w_val) -> pd.DataFrame:
-    if portfolio.empty:
-        return portfolio
+def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, weighting_scheme: str) -> pd.DataFrame:
+    if portfolio.empty or total_capital <= 0:
+        return portfolio.assign(**{"Valore Nominale (€)": 0, "Controvalore di Mercato (€)": 0, "Peso (%)": 0})
 
-    portfolio['Peso (%)'] = 0.0
-    
-    # Gerarchia dei vincoli per la ponderazione
-    constraint_hierarchy = [
-        ("Scadenza", w_mat), ("Settore", w_sec),
-        ("TipoEmittente", w_iss), ("Valuta", w_val)
-    ]
-    
-    active_constraint_dim = None
-    active_constraint_targets = None
-    for col, targets in constraint_hierarchy:
-        if targets:
-            active_constraint_dim = col
-            active_constraint_targets = targets
-            break # Usa il primo vincolo attivo nella gerarchia
+    # Calcolo pesi target iniziali
+    if weighting_scheme == 'Risk Weighted':
+        total_risk = portfolio['ScoreRischio'].sum()
+        portfolio['target_weight'] = portfolio['ScoreRischio'] / total_risk if total_risk > 0 else 1 / len(portfolio)
+    else: # Equally Weighted
+        portfolio['target_weight'] = 1 / len(portfolio)
 
-    # Se ci sono vincoli attivi, pesa all'interno dei comparti
-    if active_constraint_dim:
-        for category, target_weight in active_constraint_targets.items():
-            mask = portfolio[active_constraint_dim] == category
-            portfolio_slice = portfolio[mask]
+    portfolio['target_capital'] = portfolio['target_weight'] * total_capital
+    
+    # Inizializzazione colonne
+    portfolio = portfolio.assign(**{"Valore Nominale (€)": 0.0, "Controvalore di Mercato (€)": 0.0})
+
+    # Fase 1: Allocazione minima obbligatoria
+    capital_allocated = 0
+    for idx, row in portfolio.iterrows():
+        min_nominal = row['DenominationMinimum']
+        market_value_per_unit = (row['MarketPrice'] / 100) + (row['AccruedInterest'] / min_nominal)
+        min_market_value = min_nominal * market_value_per_unit
+        
+        portfolio.loc[idx, 'Valore Nominale (€)'] = min_nominal
+        portfolio.loc[idx, 'Controvalore di Mercato (€)'] = min_market_value
+        capital_allocated += min_market_value
+    
+    capital_remaining = total_capital - capital_allocated
+    if capital_remaining < 0:
+        raise ValueError(f"Il capitale totale ({total_capital:,.0f}€) è insufficiente per coprire l'investimento minimo in tutti i titoli selezionati ({capital_allocated:,.0f}€).")
+
+    # Fase 2: Allocazione del capitale rimanente basata su target e lotti
+    while capital_remaining > 0:
+        portfolio['current_weight'] = portfolio['Controvalore di Mercato (€)'] / capital_allocated
+        portfolio['weight_diff'] = portfolio['target_weight'] - portfolio['current_weight']
+        
+        # Seleziona il titolo più "sottopesato"
+        most_underweight_idx = portfolio['weight_diff'].idxmax()
+        
+        row = portfolio.loc[most_underweight_idx]
+        increment_nominal = row['DenominationIncrement']
+        market_value_per_unit = (row['MarketPrice'] / 100) + (row['AccruedInterest'] / (row['Valore Nominale (€)'] or 1)) # Approx
+        increment_market_value = increment_nominal * market_value_per_unit
+
+        if capital_remaining >= increment_market_value:
+            portfolio.loc[most_underweight_idx, 'Valore Nominale (€)'] += increment_nominal
+            portfolio.loc[most_underweight_idx, 'Controvalore di Mercato (€)'] += increment_market_value
+            capital_allocated += increment_market_value
+            capital_remaining -= increment_market_value
+        else:
+            # Non c'è abbastanza capitale per l'incremento più piccolo, quindi ci fermiamo
+            break
             
-            if not portfolio_slice.empty:
-                if weighting_scheme == 'Risk Weighted':
-                    total_risk_slice = portfolio_slice['ScoreRischio'].sum()
-                    if total_risk_slice > 0:
-                        slice_weights = (portfolio_slice['ScoreRischio'] / total_risk_slice) * target_weight
-                        portfolio.loc[mask, 'Peso (%)'] = slice_weights
-                    else: # Fallback a equal weight nel comparto
-                        portfolio.loc[mask, 'Peso (%)'] = target_weight / len(portfolio_slice)
-                else: # Equally Weighted nel comparto
-                    portfolio.loc[mask, 'Peso (%)'] = target_weight / len(portfolio_slice)
-    # Se non ci sono vincoli, pesa sull'intero portafoglio
-    else:
-        if weighting_scheme == 'Risk Weighted':
-            total_risk_portfolio = portfolio['ScoreRischio'].sum()
-            if total_risk_portfolio > 0:
-                portfolio['Peso (%)'] = (portfolio['ScoreRischio'] / total_risk_portfolio) * 100
-            else: # Fallback
-                portfolio['Peso (%)'] = 100 / len(portfolio)
-        else: # Equally Weighted
-            portfolio['Peso (%)'] = 100 / len(portfolio)
+    # Calcolo pesi finali
+    total_market_value = portfolio['Controvalore di Mercato (€)'].sum()
+    if total_market_value > 0:
+        portfolio['Peso (%)'] = (portfolio['Controvalore di Mercato (€)'] / total_market_value) * 100
+    
+    return portfolio.drop(columns=['target_weight', 'target_capital', 'current_weight', 'weight_diff'])
 
-    return portfolio
 
 st.set_page_config(page_title="Bond Portfolio Selector", layout="wide")
 st.title("Bond Portfolio Selector — Ottimizzazione con Vincoli")
@@ -240,19 +222,20 @@ if uploaded:
         st.success(f"File caricato e processato: {len(df)} titoli validi.")
         
         st.sidebar.header("Parametri Portafoglio")
-        n = st.sidebar.number_input("Numero di titoli (n)", min_value=1, max_value=len(df), value=min(20, len(df)))
+        total_capital = st.sidebar.number_input("Valore Portafoglio (€)", min_value=1000, value=100000, step=1000)
+        n = st.sidebar.number_input("Numero di titoli (n)", min_value=1, max_value=len(df), value=min(10, len(df)))
 
         st.sidebar.markdown("---")
         st.sidebar.subheader("Schema di Ponderazione")
         weighting_scheme = st.sidebar.radio(
-            "Scegli come allocare il capitale nel portafoglio finale:",
+            "Scegli come allocare il capitale:",
             ("Equally Weighted", "Risk Weighted"),
             key="weighting_scheme",
-            help="**Equally Weighted**: I titoli selezionati hanno lo stesso peso. **Risk Weighted**: I titoli selezionati sono pesati in base al loro ScoreRischio."
+            help="**Equally Weighted**: I titoli hanno lo stesso peso target. **Risk Weighted**: I titoli hanno un peso target proporzionale al loro ScoreRischio."
         )
 
         st.sidebar.markdown("---")
-        st.sidebar.subheader("Vincoli di costruzione")
+        st.sidebar.subheader("Vincoli di Selezione (per numero di titoli)")
         use_val = st.sidebar.checkbox("Vincola per Valuta")
         use_iss = st.sidebar.checkbox("Vincola per Tipo Emittente")
         use_sec = st.sidebar.checkbox("Vincola per Settore")
@@ -265,8 +248,7 @@ if uploaded:
         
         def get_weights_from_user(title, options, key_prefix):
             st.subheader(title)
-            weights = {opt: st.number_input(f"{opt} (%)", 0.0, 100.0, 0.0, key=f"{key_prefix}_{opt}") for opt in options}
-            return weights
+            return {opt: st.number_input(f"{opt} (%)", 0.0, 100.0, 0.0, key=f"{key_prefix}_{opt}") for opt in options}
 
         cols = st.columns(2)
         with cols[0]:
@@ -290,32 +272,30 @@ if uploaded:
         is_valid_mat, w_mat = validate_weights(w_mat, "Scadenza")
         is_valid = all([is_valid_val, is_valid_iss, is_valid_sec, is_valid_mat])
 
-        active_constraints = [name for name, weights in [('Scadenza', w_mat), ('Settore', w_sec), ('Tipo Emittente', w_iss), ('Valuta', w_val)] if weights]
-        if weighting_scheme == 'Risk Weighted' and len(active_constraints) > 1:
-            st.warning(f"Hai attivato più vincoli con ponderazione a rischio. I pesi finali saranno calcolati usando solo il primo vincolo nella gerarchia: Scadenza > Settore > Tipo Emittente > Valuta.")
-
         if st.button("Costruisci Portafoglio"):
-            if not is_valid:
-                st.stop()
+            if not is_valid: st.stop()
             
-            with st.spinner("Ottimizzazione in corso..."):
+            with st.spinner("Ottimizzazione e allocazione in corso..."):
                 try:
-                    has_constraints = any([w_val, w_iss, w_sec, w_mat])
-                    
-                    # La selezione dei titoli usa sempre lo schema EW/RW definito nella sidebar
+                    # Fase 1: Selezione dei migliori N titoli
                     portfolio_selection = build_portfolio_milp(universe, n, w_val, w_iss, w_sec, w_mat, weighting_scheme)
-
+                    
+                    # Fase 2: Allocazione del capitale
+                    portfolio = calculate_capital_allocation(portfolio_selection, total_capital, weighting_scheme)
                     st.success("Portafoglio generato con successo!")
 
-                    # Calcola i pesi finali per la visualizzazione e il CSV
-                    portfolio = calculate_final_weights(portfolio_selection, weighting_scheme, w_mat, w_sec, w_iss, w_val)
-                    portfolio['Peso (%)'] = portfolio['Peso (%)'].round(2)
-                    
-                    cols_order = ['Peso (%)'] + [col for col in portfolio.columns if col != 'Peso (%)']
-                    portfolio = portfolio[cols_order]
+                    cols_order = ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)'] + [c for c in portfolio.columns if c not in ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)']]
+                    portfolio_display = portfolio[cols_order].copy()
+                    for col in ['Valore Nominale (€)', 'Controvalore di Mercato (€)']:
+                        portfolio_display[col] = portfolio_display[col].map('{:,.0f}'.format)
+                    portfolio_display['Peso (%)'] = portfolio_display['Peso (%)'].map('{:.2f}%'.format)
 
-                    st.dataframe(portfolio)
+                    st.dataframe(portfolio_display)
                     
+                    st.subheader("Riepilogo Allocazione Capitale")
+                    invested_capital = portfolio['Controvalore di Mercato (€)'].sum()
+                    st.metric("Capitale Investito", f"€ {invested_capital:,.2f}", f"€ {total_capital - invested_capital:,.2f} non allocato")
+
                     st.subheader("Distribuzione Pesi del Portafoglio")
                     fig_pie, ax_pie = plt.subplots()
                     ax_pie.pie(portfolio['Peso (%)'], labels=portfolio['ISIN'], autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8})
@@ -325,43 +305,20 @@ if uploaded:
                     csv = portfolio.to_csv(index=False).encode('utf-8')
                     st.download_button("Scarica Portafoglio (CSV)", data=csv, file_name="portafoglio_ottimizzato.csv")
                     
-                    if has_constraints:
-                        st.header("Confronto Target vs Effettivo")
-                        
-                        # Funzione di calcolo pesi effettivi CORRETTA
-                        compute_dist = lambda df_port, col: df_port.groupby(col)['Peso (%)'].sum()
+                    # Grafici di confronto basati sui pesi effettivi
+                    st.header("Confronto Target vs Effettivo (per numero titoli)")
+                    compute_dist_count = lambda df_port, col: (df_port[col].value_counts(normalize=True) * 100).round(1)
+                    
+                    distr_count = {"Valuta": (w_val, compute_dist_count(portfolio, "Valuta")), "TipoEmittente": (w_iss, compute_dist_count(portfolio, "TipoEmittente")),
+                                   "Settore": (w_sec, compute_dist_count(portfolio, "Settore")), "Scadenza": (w_mat, compute_dist_count(portfolio, "Scadenza"))}
 
-                        distr = {
-                            "Valuta": (w_val, compute_dist(portfolio, "Valuta")),
-                            "TipoEmittente": (w_iss, compute_dist(portfolio, "TipoEmittente")),
-                            "Settore": (w_sec, compute_dist(portfolio, "Settore")),
-                            "Scadenza": (w_mat, compute_dist(portfolio, "Scadenza")),
-                        }
-
-                        for crit, (target, actual) in distr.items():
-                            if not target: continue
-                            st.subheader(crit)
-                            cats = sorted(set(list(target.keys())) | set(actual.index.astype(str)))
-                            rows = []
-                            for c in cats:
-                                tgt_val = target.get(c, 0.0)
-                                act_val = float(actual.get(c, 0.0))
-                                rows.append({crit: c, "Target %": f"{tgt_val:.1f}", "Effettivo %": f"{act_val:.1f}"})
-                            df_table = pd.DataFrame(rows)
-                            st.dataframe(df_table)
-
-                            fig_bar, ax_bar = plt.subplots()
-                            x = np.arange(len(cats))
-                            width = 0.35
-                            ax_bar.bar(x - width/2, [float(r["Effettivo %"]) for r in rows], width, label="Effettivo")
-                            ax_bar.bar(x + width/2, [float(r["Target %"]) for r in rows], width, label="Target")
-                            ax_bar.set_ylabel("Percentuale (%)")
-                            ax_bar.set_title(f'Confronto per {crit}')
-                            ax_bar.set_xticks(x)
-                            ax_bar.set_xticklabels(cats, rotation=45, ha="right")
-                            ax_bar.legend()
-                            plt.tight_layout()
-                            st.pyplot(fig_bar)
+                    for crit, (target, actual) in distr_count.items():
+                        if not target: continue
+                        st.subheader(f"Distribuzione per {crit}")
+                        cats = sorted(set(list(target.keys())) | set(actual.index.astype(str)))
+                        rows = []
+                        for c in cats: rows.append({crit: c, "Target (num. titoli) %": target.get(c, 0.0), "Effettivo (num. titoli) %": float(actual.get(c, 0.0))})
+                        st.dataframe(pd.DataFrame(rows))
                     
                     st.balloons()
 
