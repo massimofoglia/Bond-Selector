@@ -151,7 +151,7 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     indices = list(df_copy.index)
     x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
     
-    # --- LOGICA DI PONDERAZIONE ---
+    # --- LOGICA DI PONDERAZIONE PER LA SELEZIONE ---
     scores = df_copy["ScoreRendimento"].fillna(0).to_dict()
     weights = {i: 1.0 for i in indices}  # Default: Equally Weighted
 
@@ -159,10 +159,8 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
         risk_scores = df_copy["ScoreRischio"].fillna(0)
         avg_risk_score = risk_scores.mean()
         if avg_risk_score > 0:
-            # Calcola i pesi basati sul rischio, con un limite massimo (cap) di 2
             weights = {i: min(2.0, risk_scores.get(i, 0) / avg_risk_score) for i in indices}
 
-    # Funzione obiettivo modificata per includere i pesi
     prob += pulp.lpSum(scores[i] * weights[i] * x[i] for i in indices)
     # --- FINE LOGICA DI PONDERAZIONE ---
     
@@ -204,7 +202,6 @@ if uploaded:
         st.sidebar.header("Parametri Portafoglio")
         n = st.sidebar.number_input("Numero di titoli (n)", min_value=1, max_value=len(df), value=min(20, len(df)))
 
-        # --- NUOVO SELETTORE PER LA PONDERAZIONE ---
         st.sidebar.markdown("---")
         st.sidebar.subheader("Schema di Ponderazione Obiettivo")
         weighting_scheme = st.sidebar.radio(
@@ -213,7 +210,6 @@ if uploaded:
             key="weighting_scheme",
             help="**Equally Weighted**: Massimizza solo lo ScoreRendimento. **Risk Weighted**: Massimizza una combinazione di ScoreRendimento e ScoreRischio (favorendo i titoli con ScoreRischio più alto)."
         )
-        # --- FINE NUOVO SELETTORE ---
 
         st.sidebar.markdown("---")
         st.sidebar.subheader("Vincoli di costruzione")
@@ -269,12 +265,37 @@ if uploaded:
                         portfolio = build_portfolio_milp(universe, n, w_val, w_iss, w_sec, w_mat, weighting_scheme)
 
                     st.success("Portafoglio generato con successo!")
-                    st.dataframe(portfolio)
-                    
+
+                    # --- NUOVA SEZIONE: CALCOLO PESI E GRAFICO A TORTA ---
+                    if not portfolio.empty:
+                        # Calcola i pesi finali del portafoglio per la visualizzazione
+                        if weighting_scheme == "Risk Weighted":
+                            total_risk_score = portfolio['ScoreRischio'].sum()
+                            if total_risk_score > 0:
+                                portfolio['Peso (%)'] = (portfolio['ScoreRischio'] / total_risk_score) * 100
+                            else:
+                                portfolio['Peso (%)'] = 100 / len(portfolio) # Fallback a equal weight
+                        else: # Equally Weighted
+                            portfolio['Peso (%)'] = 100 / len(portfolio)
+                        
+                        portfolio['Peso (%)'] = portfolio['Peso (%)'].round(2)
+                        
+                        # Sposta la colonna 'Peso (%)' all'inizio per una migliore visibilità
+                        cols_order = ['Peso (%)'] + [col for col in portfolio.columns if col != 'Peso (%)']
+                        portfolio = portfolio[cols_order]
+
+                        st.dataframe(portfolio)
+                        
+                        st.subheader("Distribuzione Pesi del Portafoglio")
+                        fig_pie, ax_pie = plt.subplots()
+                        ax_pie.pie(portfolio['Peso (%)'], labels=portfolio['ISIN'], autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8})
+                        ax_pie.axis('equal')
+                        st.pyplot(fig_pie)
+                    # --- FINE NUOVA SEZIONE ---
+
                     csv = portfolio.to_csv(index=False).encode('utf-8')
                     st.download_button("Scarica Portafoglio (CSV)", data=csv, file_name="portafoglio_ottimizzato.csv")
                     
-                    # --- SEZIONE GRAFICI E CONFRONTO ---
                     if has_constraints:
                         st.header("Confronto Target vs Effettivo")
                         
@@ -300,19 +321,18 @@ if uploaded:
                             df_table = pd.DataFrame(rows)
                             st.dataframe(df_table)
 
-                            # Grafico a barre
-                            fig, ax = plt.subplots()
+                            fig_bar, ax_bar = plt.subplots()
                             x = np.arange(len(cats))
                             width = 0.35
-                            ax.bar(x - width/2, [float(r["Effettivo %"]) for r in rows], width, label="Effettivo")
-                            ax.bar(x + width/2, [float(r["Target %"]) for r in rows], width, label="Target")
-                            ax.set_ylabel("Percentuale (%)")
-                            ax.set_title(f'Confronto per {crit}')
-                            ax.set_xticks(x)
-                            ax.set_xticklabels(cats, rotation=45, ha="right")
-                            ax.legend()
+                            ax_bar.bar(x - width/2, [float(r["Effettivo %"]) for r in rows], width, label="Effettivo")
+                            ax_bar.bar(x + width/2, [float(r["Target %"]) for r in rows], width, label="Target")
+                            ax_bar.set_ylabel("Percentuale (%)")
+                            ax_bar.set_title(f'Confronto per {crit}')
+                            ax_bar.set_xticks(x)
+                            ax_bar.set_xticklabels(cats, rotation=45, ha="right")
+                            ax_bar.legend()
                             plt.tight_layout()
-                            st.pyplot(fig)
+                            st.pyplot(fig_bar)
                     
                     st.balloons()
 
