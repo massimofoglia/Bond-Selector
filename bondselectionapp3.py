@@ -137,7 +137,7 @@ def _solve_and_get_status(prob, solver):
     except Exception as e:
         raise RuntimeError(f"Il risolutore MILP ha generato un errore critico: {e}")
 
-def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec, targ_mat) -> pd.DataFrame:
+def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec, targ_mat, weighting_scheme: str) -> pd.DataFrame:
     if pulp is None:
         raise RuntimeError("La libreria PuLP non è installata. Esegui: pip install pulp")
 
@@ -150,18 +150,31 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     df_copy = df.reset_index(drop=True)
     indices = list(df_copy.index)
     x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
+    
+    # --- LOGICA DI PONDERAZIONE ---
     scores = df_copy["ScoreRendimento"].fillna(0).to_dict()
+    weights = {i: 1.0 for i in indices}  # Default: Equally Weighted
 
-    prob += pulp.lpSum(scores[i] * x[i] for i in indices)
+    if weighting_scheme == "Risk Weighted":
+        risk_scores = df_copy["ScoreRischio"].fillna(0)
+        avg_risk_score = risk_scores.mean()
+        if avg_risk_score > 0:
+            # Calcola i pesi basati sul rischio, con un limite massimo (cap) di 2
+            weights = {i: min(2.0, risk_scores.get(i, 0) / avg_risk_score) for i in indices}
+
+    # Funzione obiettivo modificata per includere i pesi
+    prob += pulp.lpSum(scores[i] * weights[i] * x[i] for i in indices)
+    # --- FINE LOGICA DI PONDERAZIONE ---
+    
     prob += pulp.lpSum(x[i] for i in indices) == n
 
     targets = {
         "Valuta": targ_val, "TipoEmittente": targ_iss,
         "Settore": targ_sec, "Scadenza": targ_mat
     }
-    for col, weights in targets.items():
-        if not weights: continue
-        for cat, count in integer_targets_from_weights(n, weights).items():
+    for col, weights_map in targets.items():
+        if not weights_map: continue
+        for cat, count in integer_targets_from_weights(n, weights_map).items():
             prob += pulp.lpSum(x[i] for i, v in df_copy[col].items() if v == str(cat)) == count
 
     corp_issuers = df_copy[df_copy["TipoEmittente"].str.contains("Corp", case=False, na=False)]["Issuer"].unique()
@@ -190,6 +203,17 @@ if uploaded:
         
         st.sidebar.header("Parametri Portafoglio")
         n = st.sidebar.number_input("Numero di titoli (n)", min_value=1, max_value=len(df), value=min(20, len(df)))
+
+        # --- NUOVO SELETTORE PER LA PONDERAZIONE ---
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Schema di Ponderazione Obiettivo")
+        weighting_scheme = st.sidebar.radio(
+            "Scegli come ponderare i titoli nella selezione:",
+            ("Equally Weighted", "Risk Weighted"),
+            key="weighting_scheme",
+            help="**Equally Weighted**: Massimizza solo lo ScoreRendimento. **Risk Weighted**: Massimizza una combinazione di ScoreRendimento e ScoreRischio (favorendo i titoli con ScoreRischio più alto)."
+        )
+        # --- FINE NUOVO SELETTORE ---
 
         st.sidebar.markdown("---")
         st.sidebar.subheader("Vincoli di costruzione")
@@ -238,11 +262,11 @@ if uploaded:
             with st.spinner("Ottimizzazione in corso..."):
                 try:
                     has_constraints = any([w_val, w_iss, w_sec, w_mat])
-                    if not has_constraints:
-                        st.info("Nessun vincolo specificato. Seleziono i migliori N titoli per Score Rendimento.")
+                    if not has_constraints and weighting_scheme == "Equally Weighted":
+                        st.info("Nessun vincolo specificato e schema Equally Weighted. Seleziono i migliori N titoli per Score Rendimento.")
                         portfolio = universe.nlargest(n, "ScoreRendimento").reset_index(drop=True)
                     else:
-                        portfolio = build_portfolio_milp(universe, n, w_val, w_iss, w_sec, w_mat)
+                        portfolio = build_portfolio_milp(universe, n, w_val, w_iss, w_sec, w_mat, weighting_scheme)
 
                     st.success("Portafoglio generato con successo!")
                     st.dataframe(portfolio)
