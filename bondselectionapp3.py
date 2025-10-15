@@ -1,5 +1,6 @@
 import io
 import math
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -45,29 +46,49 @@ def _read_csv_any(uploaded) -> pd.DataFrame:
             last_err = e
     raise last_err
 
+def find_and_rename_columns(df: pd.DataFrame, alias_map: Dict[str, List[str]]) -> pd.DataFrame:
+    """
+    Funzione robusta per rinominare le colonne basandosi su alias, ignorando spazi e maiuscole/minuscole.
+    """
+    rename_dict = {}
+    
+    # Pulisce i nomi delle colonne nel DataFrame
+    cleaned_columns = {col: re.sub(r'[^A-Za-z0-9]+', '', col).lower() for col in df.columns}
+    
+    for standard_name, aliases in alias_map.items():
+        for alias in aliases:
+            # Pulisce l'alias per il confronto
+            cleaned_alias = re.sub(r'[^A-Za-z0-9]+', '', alias).lower()
+            
+            for original_col, cleaned_col in cleaned_columns.items():
+                if cleaned_col == cleaned_alias:
+                    rename_dict[original_col] = standard_name
+                    break
+            if standard_name in rename_dict.values():
+                break
+                
+    return df.rename(columns=rename_dict)
+
+
 def load_and_normalize(uploaded) -> pd.DataFrame:
     df = _read_csv_any(uploaded)
     
-    # --- CORREZIONE CHIAVE: Pulisce i nomi delle colonne da spazi extra ---
-    df.columns = df.columns.str.strip()
-    # --- FINE CORREZIONE ---
-
+    # Se la prima riga è un header duplicato, la rimuove
     if "ISIN" in df.columns and isinstance(df.loc[0, "ISIN"], str) and df.loc[0, "ISIN"].strip().upper() == "ISIN":
         df = df.iloc[1:].reset_index(drop=True)
 
-    rename_map = {a: std for std, aliases in REQUIRED_COLS_ALIASES.items() for a in aliases if a in df.columns}
-    df = df.rename(columns=rename_map)
+    # Usa la nuova funzione robusta per rinominare le colonne
+    df = find_and_rename_columns(df, REQUIRED_COLS_ALIASES)
 
     required = ["ISIN", "Issuer", "Maturity", "Currency", "ExchangeName", "ScoreRendimento", "ScoreRischio",
                 "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]
     missing_cols = [c for c in required if c not in df.columns]
     if missing_cols:
-        raise ValueError(f"Colonne obbligatorie mancanti: {', '.join(missing_cols)}")
+        raise ValueError(f"Colonne obbligatorie mancanti dopo il tentativo di mappatura: {', '.join(missing_cols)}")
 
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
     for col in ["ScoreRendimento", "ScoreRischio", "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]:
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
-
 
     if "IssuerType" not in df.columns: df["IssuerType"] = df.get("Comparto", pd.Series(dtype=str)).astype(str).map(_infer_issuer_type)
     if "Sector" not in df.columns: df["Sector"] = np.where(df["IssuerType"].str.contains("Govt", case=False, na=False), "Government", "Unknown")
@@ -83,6 +104,7 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
         if c in df.columns: df[c] = df[c].fillna("Unknown").astype(str)
 
     return df.dropna(subset=required).reset_index(drop=True)
+
 
 def _infer_issuer_type(comparto: str) -> str:
     s = str(comparto).lower()
