@@ -87,10 +87,17 @@ def _infer_issuer_type(comparto: str) -> str:
     return "Unknown"
 
 def _map_sector(s: str) -> str:
-    s = str(s).lower()
-    if "gov" in s: return "Govt"
-    if "fin" in s: return "Financials"
+    s_lower = str(s).lower()
+    financial_keywords = [
+        'fin', 'banking', 'insurance', 'leasing', 'securit', 
+        'other financial', 'real estate', 'asset management'
+    ]
+    if 'gov' in s_lower:
+        return "Govt"
+    if any(keyword in s_lower for keyword in financial_keywords):
+        return "Financials"
     return "Non Financials"
+
 
 def integer_targets_from_weights(n: int, weights: Dict[str, float]) -> Dict[str, int]:
     if not weights: return {}
@@ -150,27 +157,34 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     else:
         raise ValueError(f"Il risolutore non ha trovato una soluzione ottimale. Stato: '{status}'. Questo indica che i vincoli sono in conflitto.")
 
-def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, weighting_scheme: str) -> pd.DataFrame:
+def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, weighting_scheme: str, n: int) -> pd.DataFrame:
     if portfolio.empty or total_capital <= 0:
         return portfolio.assign(**{"Valore Nominale (€)": 0, "Controvalore di Mercato (€)": 0, "Peso (%)": 0})
 
-    # Calcolo pesi target iniziali
+    # --- NUOVA LOGICA DI ARROTONDAMENTO PESI TARGET ---
+    # 1. Calcola i pesi target grezzi
     if weighting_scheme == 'Risk Weighted':
         total_risk = portfolio['ScoreRischio'].sum()
-        portfolio['target_weight'] = portfolio['ScoreRischio'] / total_risk if total_risk > 0 else 1 / len(portfolio)
+        raw_weights = portfolio['ScoreRischio'] / total_risk if total_risk > 0 else 1 / n
     else: # Equally Weighted
-        portfolio['target_weight'] = 1 / len(portfolio)
+        raw_weights = pd.Series([1/n] * n, index=portfolio.index)
+
+    # 2. Arrotonda i pesi a multipli dello step e normalizza
+    step = 1 / (4 * n) # Pesante in centesimi: 100 / (4*n)
+    rounded_weights = (raw_weights / step).round() * step
+    normalized_weights = rounded_weights / rounded_weights.sum() # Normalizza per assicurare che la somma sia 1
+    portfolio['target_weight'] = normalized_weights
+    # --- FINE NUOVA LOGICA ---
 
     portfolio['target_capital'] = portfolio['target_weight'] * total_capital
     
-    # Inizializzazione colonne
     portfolio = portfolio.assign(**{"Valore Nominale (€)": 0.0, "Controvalore di Mercato (€)": 0.0})
 
-    # Fase 1: Allocazione minima obbligatoria
     capital_allocated = 0
     for idx, row in portfolio.iterrows():
         min_nominal = row['DenominationMinimum']
-        market_value_per_unit = (row['MarketPrice'] / 100) + (row['AccruedInterest'] / min_nominal)
+        # Calcolo del prezzo dirty per unità di nominale
+        market_value_per_unit = (row['MarketPrice'] + row['AccruedInterest']) / 100
         min_market_value = min_nominal * market_value_per_unit
         
         portfolio.loc[idx, 'Valore Nominale (€)'] = min_nominal
@@ -179,36 +193,33 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
     
     capital_remaining = total_capital - capital_allocated
     if capital_remaining < 0:
-        raise ValueError(f"Il capitale totale ({total_capital:,.0f}€) è insufficiente per coprire l'investimento minimo in tutti i titoli selezionati ({capital_allocated:,.0f}€).")
+        raise ValueError(f"Il capitale totale ({total_capital:,.0f}€) è insufficiente per coprire l'investimento minimo in tutti i titoli ({capital_allocated:,.0f}€).")
 
-    # Fase 2: Allocazione del capitale rimanente basata su target e lotti
     while capital_remaining > 0:
-        portfolio['current_weight'] = portfolio['Controvalore di Mercato (€)'] / capital_allocated
-        portfolio['weight_diff'] = portfolio['target_weight'] - portfolio['current_weight']
+        portfolio['current_capital'] = portfolio['Controvalore di Mercato (€)']
+        portfolio['capital_diff'] = portfolio['target_capital'] - portfolio['current_capital']
         
-        # Seleziona il titolo più "sottopesato"
-        most_underweight_idx = portfolio['weight_diff'].idxmax()
+        if portfolio['capital_diff'].max() <= 0: break
+            
+        most_underfunded_idx = portfolio['capital_diff'].idxmax()
         
-        row = portfolio.loc[most_underweight_idx]
+        row = portfolio.loc[most_underfunded_idx]
         increment_nominal = row['DenominationIncrement']
-        market_value_per_unit = (row['MarketPrice'] / 100) + (row['AccruedInterest'] / (row['Valore Nominale (€)'] or 1)) # Approx
+        market_value_per_unit = (row['MarketPrice'] + row['AccruedInterest']) / 100
         increment_market_value = increment_nominal * market_value_per_unit
 
         if capital_remaining >= increment_market_value:
-            portfolio.loc[most_underweight_idx, 'Valore Nominale (€)'] += increment_nominal
-            portfolio.loc[most_underweight_idx, 'Controvalore di Mercato (€)'] += increment_market_value
-            capital_allocated += increment_market_value
+            portfolio.loc[most_underfunded_idx, 'Valore Nominale (€)'] += increment_nominal
+            portfolio.loc[most_underfunded_idx, 'Controvalore di Mercato (€)'] += increment_market_value
             capital_remaining -= increment_market_value
         else:
-            # Non c'è abbastanza capitale per l'incremento più piccolo, quindi ci fermiamo
             break
             
-    # Calcolo pesi finali
     total_market_value = portfolio['Controvalore di Mercato (€)'].sum()
     if total_market_value > 0:
         portfolio['Peso (%)'] = (portfolio['Controvalore di Mercato (€)'] / total_market_value) * 100
     
-    return portfolio.drop(columns=['target_weight', 'target_capital', 'current_weight', 'weight_diff'])
+    return portfolio.drop(columns=['target_weight', 'target_capital', 'current_capital', 'capital_diff'], errors='ignore')
 
 
 st.set_page_config(page_title="Bond Portfolio Selector", layout="wide")
@@ -228,7 +239,7 @@ if uploaded:
         st.sidebar.markdown("---")
         st.sidebar.subheader("Schema di Ponderazione")
         weighting_scheme = st.sidebar.radio(
-            "Scegli come allocare il capitale:",
+            "Scegli il criterio per i pesi target:",
             ("Equally Weighted", "Risk Weighted"),
             key="weighting_scheme",
             help="**Equally Weighted**: I titoli hanno lo stesso peso target. **Risk Weighted**: I titoli hanno un peso target proporzionale al loro ScoreRischio."
@@ -277,11 +288,8 @@ if uploaded:
             
             with st.spinner("Ottimizzazione e allocazione in corso..."):
                 try:
-                    # Fase 1: Selezione dei migliori N titoli
                     portfolio_selection = build_portfolio_milp(universe, n, w_val, w_iss, w_sec, w_mat, weighting_scheme)
-                    
-                    # Fase 2: Allocazione del capitale
-                    portfolio = calculate_capital_allocation(portfolio_selection, total_capital, weighting_scheme)
+                    portfolio = calculate_capital_allocation(portfolio_selection, total_capital, weighting_scheme, n)
                     st.success("Portafoglio generato con successo!")
 
                     cols_order = ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)'] + [c for c in portfolio.columns if c not in ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)']]
@@ -305,20 +313,21 @@ if uploaded:
                     csv = portfolio.to_csv(index=False).encode('utf-8')
                     st.download_button("Scarica Portafoglio (CSV)", data=csv, file_name="portafoglio_ottimizzato.csv")
                     
-                    # Grafici di confronto basati sui pesi effettivi
-                    st.header("Confronto Target vs Effettivo (per numero titoli)")
-                    compute_dist_count = lambda df_port, col: (df_port[col].value_counts(normalize=True) * 100).round(1)
-                    
-                    distr_count = {"Valuta": (w_val, compute_dist_count(portfolio, "Valuta")), "TipoEmittente": (w_iss, compute_dist_count(portfolio, "TipoEmittente")),
-                                   "Settore": (w_sec, compute_dist_count(portfolio, "Settore")), "Scadenza": (w_mat, compute_dist_count(portfolio, "Scadenza"))}
+                    if any([w_val, w_iss, w_sec, w_mat]):
+                        st.header("Confronto Target vs Effettivo (per numero titoli)")
+                        compute_dist_count = lambda df_port, col: (df_port[col].value_counts(normalize=True) * 100)
+                        
+                        distr_count = {"Valuta": (w_val, compute_dist_count(portfolio, "Valuta")), "TipoEmittente": (w_iss, compute_dist_count(portfolio, "TipoEmittente")),
+                                    "Settore": (w_sec, compute_dist_count(portfolio, "Settore")), "Scadenza": (w_mat, compute_dist_count(portfolio, "Scadenza"))}
 
-                    for crit, (target, actual) in distr_count.items():
-                        if not target: continue
-                        st.subheader(f"Distribuzione per {crit}")
-                        cats = sorted(set(list(target.keys())) | set(actual.index.astype(str)))
-                        rows = []
-                        for c in cats: rows.append({crit: c, "Target (num. titoli) %": target.get(c, 0.0), "Effettivo (num. titoli) %": float(actual.get(c, 0.0))})
-                        st.dataframe(pd.DataFrame(rows))
+                        for crit, (target, actual) in distr_count.items():
+                            if not target: continue
+                            st.subheader(f"Distribuzione per {crit}")
+                            cats = sorted(set(list(target.keys())) | set(actual.index.astype(str)))
+                            rows = []
+                            for c in cats: rows.append({crit: c, "Target (num. titoli) %": target.get(c, 0.0), "Effettivo (num. titoli) %": float(actual.get(c, 0.0))})
+                            df_table = pd.DataFrame(rows)
+                            st.dataframe(df_table)
                     
                     st.balloons()
 
