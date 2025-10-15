@@ -25,17 +25,17 @@ REQUIRED_COLS_ALIASES = {
     "Currency": ["Currency", "ISO Currency", "Valuta"],
     "Sector": ["Sector", "Settore"],
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
-    "ExchangeName": ["ExchangeName", "Exchange Name", "Mercato"], # NUOVO CAMPO
+    "ExchangeName": ["ExchangeName", "Exchange Name", "Mercato"],
     "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRet"],
     "ScoreRischio": ["ScoreRischio", "Score Risk", "Score Rischio", "ScoreRisk"],
-    "MarketPrice": ["MarketPrice", "Market Price", "Prezzo Mercato", "PrezzoDirty"],
+    "MarketPrice": ["MarketPrice", "Market Price", "Prezzo Mercato", "PrezzoDirty", "Ask Price"], # AGGIORNATO
     "AccruedInterest": ["AccruedInterest", "Accrued Interest", "Rateo"],
     "DenominationMinimum": ["DenominationMinimum", "Denomination Minimum", "Lotto Minimo"],
     "DenominationIncrement": ["DenominationIncrement", "Denomination Increment", "Lotto Incremento"],
 }
 
 def _read_csv_any(uploaded) -> pd.DataFrame:
-    encodings = ["utf-8", "ISO-885 sinistra-1", "latin1", "cp1252"]
+    encodings = ["utf-8", "ISO-8859-1", "latin1", "cp1252"]
     last_err = None
     for enc in encodings:
         try:
