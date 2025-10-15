@@ -28,7 +28,7 @@ REQUIRED_COLS_ALIASES = {
     "ExchangeName": ["ExchangeName", "Exchange Name", "Mercato"],
     "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRet"],
     "ScoreRischio": ["ScoreRischio", "Score Risk", "Score Rischio", "ScoreRisk"],
-    "MarketPrice": ["MarketPrice", "Market Price", "Prezzo Mercato", "PrezzoDirty", "Ask Price"], # AGGIORNATO
+    "MarketPrice": ["MarketPrice", "Market Price", "Prezzo Mercato", "PrezzoDirty", "Ask Price"],
     "AccruedInterest": ["AccruedInterest", "Accrued Interest", "Rateo"],
     "DenominationMinimum": ["DenominationMinimum", "Denomination Minimum", "Lotto Minimo"],
     "DenominationIncrement": ["DenominationIncrement", "Denomination Increment", "Lotto Incremento"],
@@ -47,6 +47,11 @@ def _read_csv_any(uploaded) -> pd.DataFrame:
 
 def load_and_normalize(uploaded) -> pd.DataFrame:
     df = _read_csv_any(uploaded)
+    
+    # --- CORREZIONE CHIAVE: Pulisce i nomi delle colonne da spazi extra ---
+    df.columns = df.columns.str.strip()
+    # --- FINE CORREZIONE ---
+
     if "ISIN" in df.columns and isinstance(df.loc[0, "ISIN"], str) and df.loc[0, "ISIN"].strip().upper() == "ISIN":
         df = df.iloc[1:].reset_index(drop=True)
 
