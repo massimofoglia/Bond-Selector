@@ -25,6 +25,7 @@ REQUIRED_COLS_ALIASES = {
     "Currency": ["Currency", "ISO Currency", "Valuta"],
     "Sector": ["Sector", "Settore"],
     "IssuerType": ["IssuerType", "Issuer Type", "TipoEmittente"],
+    "ExchangeName": ["ExchangeName", "Exchange Name", "Mercato"], # NUOVO CAMPO
     "ScoreRendimento": ["ScoreRendimento", "Score Ret", "Score Rendimento", "ScoreRet"],
     "ScoreRischio": ["ScoreRischio", "Score Risk", "Score Rischio", "ScoreRisk"],
     "MarketPrice": ["MarketPrice", "Market Price", "Prezzo Mercato", "PrezzoDirty"],
@@ -34,7 +35,7 @@ REQUIRED_COLS_ALIASES = {
 }
 
 def _read_csv_any(uploaded) -> pd.DataFrame:
-    encodings = ["utf-8", "ISO-8859-1", "latin1", "cp1252"]
+    encodings = ["utf-8", "ISO-885 sinistra-1", "latin1", "cp1252"]
     last_err = None
     for enc in encodings:
         try:
@@ -52,7 +53,7 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     rename_map = {a: std for std, aliases in REQUIRED_COLS_ALIASES.items() for a in aliases if a in df.columns}
     df = df.rename(columns=rename_map)
 
-    required = ["ISIN", "Issuer", "Maturity", "Currency", "ScoreRendimento", "ScoreRischio", 
+    required = ["ISIN", "Issuer", "Maturity", "Currency", "ExchangeName", "ScoreRendimento", "ScoreRischio",
                 "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]
     missing_cols = [c for c in required if c not in df.columns]
     if missing_cols:
@@ -73,7 +74,7 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     df["Scadenza"] = df["YearsToMaturity"].apply(lambda y: "Short" if y <= 3 else ("Medium" if y <= 7 else "Long") if pd.notna(y) else "Unknown")
     df["Settore"] = df["Settore"].apply(_map_sector)
 
-    for c in ["Valuta", "TipoEmittente", "Settore", "Scadenza", "Issuer"]:
+    for c in ["Valuta", "TipoEmittente", "Settore", "Scadenza", "Issuer", "ExchangeName"]:
         if c in df.columns: df[c] = df[c].fillna("Unknown").astype(str)
 
     return df.dropna(subset=required).reset_index(drop=True)
@@ -89,7 +90,7 @@ def _infer_issuer_type(comparto: str) -> str:
 def _map_sector(s: str) -> str:
     s_lower = str(s).lower()
     financial_keywords = [
-        'fin', 'banking', 'insurance', 'leasing', 'securit', 
+        'fin', 'banking', 'insurance', 'leasing', 'securit',
         'other financial', 'real estate', 'asset management'
     ]
     if 'gov' in s_lower:
@@ -126,7 +127,7 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     df_copy = df.reset_index(drop=True)
     indices = list(df_copy.index)
     x = {i: pulp.LpVariable(f"x_{i}", cat=pulp.LpBinary) for i in indices}
-    
+
     scores = df_copy["ScoreRendimento"].fillna(0).to_dict()
     weights = {i: 1.0 for i in indices}
     if weighting_scheme == "Risk Weighted":
@@ -161,36 +162,31 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
     if portfolio.empty or total_capital <= 0:
         return portfolio.assign(**{"Valore Nominale (€)": 0, "Controvalore di Mercato (€)": 0, "Peso (%)": 0})
 
-    # --- NUOVA LOGICA DI ARROTONDAMENTO PESI TARGET ---
-    # 1. Calcola i pesi target grezzi
     if weighting_scheme == 'Risk Weighted':
         total_risk = portfolio['ScoreRischio'].sum()
         raw_weights = portfolio['ScoreRischio'] / total_risk if total_risk > 0 else 1 / n
     else: # Equally Weighted
         raw_weights = pd.Series([1/n] * n, index=portfolio.index)
 
-    # 2. Arrotonda i pesi a multipli dello step e normalizza
-    step = 1 / (4 * n) # Pesante in centesimi: 100 / (4*n)
+    step = 1 / (4 * n)
     rounded_weights = (raw_weights / step).round() * step
-    normalized_weights = rounded_weights / rounded_weights.sum() # Normalizza per assicurare che la somma sia 1
+    normalized_weights = rounded_weights / rounded_weights.sum()
     portfolio['target_weight'] = normalized_weights
-    # --- FINE NUOVA LOGICA ---
 
     portfolio['target_capital'] = portfolio['target_weight'] * total_capital
-    
+
     portfolio = portfolio.assign(**{"Valore Nominale (€)": 0.0, "Controvalore di Mercato (€)": 0.0})
 
     capital_allocated = 0
     for idx, row in portfolio.iterrows():
         min_nominal = row['DenominationMinimum']
-        # Calcolo del prezzo dirty per unità di nominale
         market_value_per_unit = (row['MarketPrice'] + row['AccruedInterest']) / 100
         min_market_value = min_nominal * market_value_per_unit
-        
+
         portfolio.loc[idx, 'Valore Nominale (€)'] = min_nominal
         portfolio.loc[idx, 'Controvalore di Mercato (€)'] = min_market_value
         capital_allocated += min_market_value
-    
+
     capital_remaining = total_capital - capital_allocated
     if capital_remaining < 0:
         raise ValueError(f"Il capitale totale ({total_capital:,.0f}€) è insufficiente per coprire l'investimento minimo in tutti i titoli ({capital_allocated:,.0f}€).")
@@ -198,11 +194,11 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
     while capital_remaining > 0:
         portfolio['current_capital'] = portfolio['Controvalore di Mercato (€)']
         portfolio['capital_diff'] = portfolio['target_capital'] - portfolio['current_capital']
-        
+
         if portfolio['capital_diff'].max() <= 0: break
-            
+
         most_underfunded_idx = portfolio['capital_diff'].idxmax()
-        
+
         row = portfolio.loc[most_underfunded_idx]
         increment_nominal = row['DenominationIncrement']
         market_value_per_unit = (row['MarketPrice'] + row['AccruedInterest']) / 100
@@ -214,11 +210,11 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
             capital_remaining -= increment_market_value
         else:
             break
-            
+
     total_market_value = portfolio['Controvalore di Mercato (€)'].sum()
     if total_market_value > 0:
         portfolio['Peso (%)'] = (portfolio['Controvalore di Mercato (€)'] / total_market_value) * 100
-    
+
     return portfolio.drop(columns=['target_weight', 'target_capital', 'current_capital', 'capital_diff'], errors='ignore')
 
 
@@ -231,10 +227,18 @@ if uploaded:
     try:
         df = load_and_normalize(uploaded)
         st.success(f"File caricato e processato: {len(df)} titoli validi.")
-        
+
         st.sidebar.header("Parametri Portafoglio")
         total_capital = st.sidebar.number_input("Valore Portafoglio (€)", min_value=1000, value=100000, step=1000)
         n = st.sidebar.number_input("Numero di titoli (n)", min_value=1, max_value=len(df), value=min(10, len(df)))
+
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Filtro per Mercato")
+        market_filter = st.sidebar.radio(
+            "Scegli su quali mercati cercare i titoli:",
+            ("Qualsiasi Mercato", "Solo Mercati Italiani"),
+            key="market_filter"
+        )
 
         st.sidebar.markdown("---")
         st.sidebar.subheader("Schema di Ponderazione")
@@ -251,12 +255,20 @@ if uploaded:
         use_iss = st.sidebar.checkbox("Vincola per Tipo Emittente")
         use_sec = st.sidebar.checkbox("Vincola per Settore")
         use_mat = st.sidebar.checkbox("Vincola per Scadenza")
-
-        universe = df[df["ScoreRendimento"] >= 20].copy()
-        st.info(f"Universo investibile (Score Rendimento >= 20): {len(universe)} titoli.")
+        
+        # Filtra l'universo in base ai filtri
+        base_universe = df[df["ScoreRendimento"] >= 20].copy()
+        
+        if market_filter == "Solo Mercati Italiani":
+            italian_exchanges = ['borsa italiana', 'euro tlx', 'hi-mtf']
+            universe = base_universe[base_universe['ExchangeName'].str.lower().str.contains('|'.join(italian_exchanges), na=False)]
+        else:
+            universe = base_universe.copy()
+            
+        st.info(f"Universo investibile (dopo filtri): {len(universe)} titoli.")
 
         w_val, w_iss, w_sec, w_mat = {}, {}, {}, {}
-        
+
         def get_weights_from_user(title, options, key_prefix):
             st.subheader(title)
             return {opt: st.number_input(f"{opt} (%)", 0.0, 100.0, 0.0, key=f"{key_prefix}_{opt}") for opt in options}
@@ -285,7 +297,14 @@ if uploaded:
 
         if st.button("Costruisci Portafoglio"):
             if not is_valid: st.stop()
-            
+            if universe.empty:
+                st.error("L'universo investibile è vuoto. Prova a modificare i filtri.")
+                st.stop()
+            if n > len(universe):
+                st.warning(f"Il numero di titoli richiesti ({n}) è maggiore dei titoli disponibili nell'universo ({len(universe)}). Verranno selezionati {len(universe)} titoli.")
+                n = len(universe)
+
+
             with st.spinner("Ottimizzazione e allocazione in corso..."):
                 try:
                     portfolio_selection = build_portfolio_milp(universe, n, w_val, w_iss, w_sec, w_mat, weighting_scheme)
@@ -299,7 +318,7 @@ if uploaded:
                     portfolio_display['Peso (%)'] = portfolio_display['Peso (%)'].map('{:.2f}%'.format)
 
                     st.dataframe(portfolio_display)
-                    
+
                     st.subheader("Riepilogo Allocazione Capitale")
                     invested_capital = portfolio['Controvalore di Mercato (€)'].sum()
                     st.metric("Capitale Investito", f"€ {invested_capital:,.2f}", f"€ {total_capital - invested_capital:,.2f} non allocato")
@@ -312,11 +331,11 @@ if uploaded:
 
                     csv = portfolio.to_csv(index=False).encode('utf-8')
                     st.download_button("Scarica Portafoglio (CSV)", data=csv, file_name="portafoglio_ottimizzato.csv")
-                    
+
                     if any([w_val, w_iss, w_sec, w_mat]):
                         st.header("Confronto Target vs Effettivo (per numero titoli)")
                         compute_dist_count = lambda df_port, col: (df_port[col].value_counts(normalize=True) * 100)
-                        
+
                         distr_count = {"Valuta": (w_val, compute_dist_count(portfolio, "Valuta")), "TipoEmittente": (w_iss, compute_dist_count(portfolio, "TipoEmittente")),
                                     "Settore": (w_sec, compute_dist_count(portfolio, "Settore")), "Scadenza": (w_mat, compute_dist_count(portfolio, "Scadenza"))}
 
@@ -328,7 +347,7 @@ if uploaded:
                             for c in cats: rows.append({crit: c, "Target (num. titoli) %": target.get(c, 0.0), "Effettivo (num. titoli) %": float(actual.get(c, 0.0))})
                             df_table = pd.DataFrame(rows)
                             st.dataframe(df_table)
-                    
+
                     st.balloons()
 
                 except (ValueError, RuntimeError) as e:
