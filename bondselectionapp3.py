@@ -46,7 +46,7 @@ def _read_data(uploaded) -> pd.DataFrame:
     for enc in encodings:
         try:
             uploaded.seek(0)
-            # engine='python' è più robusto con separatori complessi
+            # engine='python' è più robusto con separatori complessi e caratteri anomali
             return pd.read_csv(uploaded, sep=separator, encoding=enc, engine='python')
         except Exception:
             continue
@@ -55,7 +55,7 @@ def _read_data(uploaded) -> pd.DataFrame:
 def load_and_normalize(uploaded) -> pd.DataFrame:
     df = _read_data(uploaded)
 
-    # Rimuove eventuali righe completamente vuote che possono essere create da alcuni editor
+    # Rimuove eventuali righe completamente vuote
     df.dropna(how='all', inplace=True)
 
     # Se la prima riga è un header duplicato, la rimuove
@@ -75,7 +75,9 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     for col in df.columns:
         cleaned_col = col.strip().lower()
         if cleaned_col in alias_to_standard_map:
-            rename_dict[col] = alias_to_standard_map[cleaned_col]
+            # Se trova una corrispondenza, la mappa per la rinomina
+            if alias_to_standard_map[cleaned_col] not in rename_dict.values():
+                 rename_dict[col] = alias_to_standard_map[cleaned_col]
             
     df = df.rename(columns=rename_dict)
 
