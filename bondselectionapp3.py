@@ -1,6 +1,8 @@
 import io
 import math
 import re
+import sys
+import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -41,6 +43,7 @@ def _read_data(uploaded) -> pd.DataFrame:
     """
     file_name = uploaded.name
     separator = '\t' if file_name.lower().endswith('.txt') else ','
+    # 'utf-8-sig' è cruciale per gestire correttamente il BOM all'inizio del file.
     encodings = ["utf-8-sig", "utf-8", "ISO-8859-1", "latin1", "cp1252"]
     
     for enc in encodings:
@@ -55,14 +58,15 @@ def _read_data(uploaded) -> pd.DataFrame:
 def load_and_normalize(uploaded) -> pd.DataFrame:
     df = _read_data(uploaded)
 
-    # Rimuove eventuali righe completamente vuote
+    # Rimuove eventuali righe e colonne completamente vuote
     df.dropna(how='all', inplace=True)
+    df.dropna(how='all', axis=1, inplace=True)
 
     # Se la prima riga è un header duplicato, la rimuove
     if len(df) > 0 and 'ISIN' in df.columns and isinstance(df.loc[0, 'ISIN'], str) and df.loc[0, 'ISIN'].strip().upper() == 'ISIN':
         df = df.iloc[1:].reset_index(drop=True)
     
-    # Costruisce una mappa di rinomina robusta (alias -> nome standard)
+    # Costruisce una mappa di rinomina robusta (alias pulito -> nome standard)
     alias_to_standard_map = {}
     for standard_name, aliases in REQUIRED_COLS_ALIASES.items():
         for alias in aliases:
@@ -75,7 +79,7 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     for col in df.columns:
         cleaned_col = col.strip().lower()
         if cleaned_col in alias_to_standard_map:
-            # Se trova una corrispondenza, la mappa per la rinomina
+            # Associa il nome della colonna originale al nome standard
             if alias_to_standard_map[cleaned_col] not in rename_dict.values():
                  rename_dict[col] = alias_to_standard_map[cleaned_col]
             
@@ -385,4 +389,15 @@ if uploaded:
                     st.error(f"Si è verificato un errore inatteso: {e}")
 
     except Exception as e:
-        st.error(f"Errore nel caricamento del file: {e}")
+        # --- NUOVO BLOCCO DI ERRORE CON DIAGNOSTICA ---
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        line_num = exc_tb.tb_lineno
+        error_message = (
+            f"**Si è verificato un errore:** {e}\n\n"
+            f"**Tipo di errore:** `{exc_type.__name__}`\n\n"
+            f"**Punto critico nel codice:** Riga `{line_num}`\n\n"
+            "**Causa probabile:** C'è un'incongruenza nel formato del file caricato che impedisce al programma di riconoscere correttamente le colonne. "
+            "Controlla che i nomi delle colonne nel tuo file corrispondano esattamente a quelli attesi (es. 'ISO Currency', 'Ask Price', etc.) e che non ci siano caratteri anomali."
+        )
+        st.error(error_message)
+        # --- FINE NUOVO BLOCCO ---
