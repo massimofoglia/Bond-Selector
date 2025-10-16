@@ -35,44 +35,53 @@ REQUIRED_COLS_ALIASES = {
     "DenominationIncrement": ["DenominationIncrement", "Denomination Increment", "Lotto Incremento"],
 }
 
-def _read_csv_any(uploaded) -> pd.DataFrame:
+def _read_data(uploaded) -> pd.DataFrame:
     """
     Legge un file CSV o TXT (tab-separated), gestendo diversi encoding e il BOM.
     """
     file_name = uploaded.name
     separator = '\t' if file_name.lower().endswith('.txt') else ','
-    
     encodings = ["utf-8-sig", "utf-8", "ISO-8859-1", "latin1", "cp1252"]
-    last_err = None
+    
     for enc in encodings:
         try:
             uploaded.seek(0)
-            return pd.read_csv(uploaded, sep=separator, encoding=enc)
-        except Exception as e:
-            last_err = e
-    raise last_err
+            return pd.read_csv(uploaded, sep=separator, encoding=enc, engine='python')
+        except Exception:
+            continue
+    raise ValueError("Impossibile leggere il file. Prova a salvarlo nuovamente in formato UTF-8.")
 
 def find_and_rename_columns(df: pd.DataFrame, alias_map: Dict[str, List[str]]) -> pd.DataFrame:
     rename_dict = {}
-    cleaned_columns = {col: re.sub(r'[^A-Za-z0-9]+', '', col).lower() for col in df.columns}
     
+    # Pulisce i nomi delle colonne del DataFrame (rimuove spazi, converte in minuscolo)
+    original_columns = df.columns
+    cleaned_df_columns = {col: col.strip().lower() for col in original_columns}
+
     for standard_name, aliases in alias_map.items():
         for alias in aliases:
-            cleaned_alias = re.sub(r'[^A-Za-z0-9]+', '', alias).lower()
-            for original_col, cleaned_col in cleaned_columns.items():
+            cleaned_alias = alias.strip().lower()
+            
+            for original_col, cleaned_col in cleaned_df_columns.items():
                 if cleaned_col == cleaned_alias:
-                    rename_dict[original_col] = standard_name
-                    break
+                    # Se trova una corrispondenza, la mappa per la rinomina
+                    if standard_name not in rename_dict.values():
+                        rename_dict[original_col] = standard_name
+                        break
             if standard_name in rename_dict.values():
                 break
+                
     return df.rename(columns=rename_dict)
 
 
 def load_and_normalize(uploaded) -> pd.DataFrame:
-    df = _read_csv_any(uploaded)
-    df.columns = df.columns.str.strip()
+    df = _read_data(uploaded)
 
-    if "ISIN" in df.columns and isinstance(df.loc[0, "ISIN"], str) and df.loc[0, "ISIN"].strip().upper() == "ISIN":
+    # Rimuove eventuali righe completamente vuote
+    df.dropna(how='all', inplace=True)
+
+    # Se la prima riga è un header duplicato, la rimuove
+    if "ISIN" in df.columns and len(df) > 0 and isinstance(df.loc[0, "ISIN"], str) and df.loc[0, "ISIN"].strip().upper() == "ISIN":
         df = df.iloc[1:].reset_index(drop=True)
 
     df = find_and_rename_columns(df, REQUIRED_COLS_ALIASES)
@@ -81,7 +90,7 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
                 "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]
     missing_cols = [c for c in required if c not in df.columns]
     if missing_cols:
-        raise ValueError(f"Colonne obbligatorie mancanti: {', '.join(missing_cols)}")
+        raise ValueError(f"Colonne obbligatorie mancanti. Colonne trovate nel file: {list(df.columns)}. Colonne mancanti: {', '.join(missing_cols)}")
 
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
     for col in ["ScoreRendimento", "ScoreRischio", "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]:
@@ -245,8 +254,7 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
 st.set_page_config(page_title="Bond Portfolio Selector", layout="wide")
 st.title("Bond Portfolio Selector — Ottimizzazione con Vincoli")
 
-# --- AGGIORNATO FILE UPLOADER ---
-uploaded = st.file_uploader("Carica il file dei titoli", type=["csv", "txt"])
+uploaded = st.file_uploader("Carica il file dei titoli (CSV o TXT)", type=["csv", "txt"])
 
 if uploaded:
     try:
