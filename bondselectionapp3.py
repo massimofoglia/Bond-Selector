@@ -37,7 +37,7 @@ REQUIRED_COLS_ALIASES = {
 
 def _read_data(uploaded) -> pd.DataFrame:
     """
-    Legge un file CSV o TXT (tab-separated), gestendo diversi encoding e il BOM.
+    Legge un file CSV o TXT, gestendo diversi encoding e il BOM in modo robusto.
     """
     file_name = uploaded.name
     separator = '\t' if file_name.lower().endswith('.txt') else ','
@@ -46,51 +46,45 @@ def _read_data(uploaded) -> pd.DataFrame:
     for enc in encodings:
         try:
             uploaded.seek(0)
+            # engine='python' è più robusto con separatori complessi
             return pd.read_csv(uploaded, sep=separator, encoding=enc, engine='python')
         except Exception:
             continue
     raise ValueError("Impossibile leggere il file. Prova a salvarlo nuovamente in formato UTF-8.")
 
-def find_and_rename_columns(df: pd.DataFrame, alias_map: Dict[str, List[str]]) -> pd.DataFrame:
-    rename_dict = {}
-    
-    # Pulisce i nomi delle colonne del DataFrame (rimuove spazi, converte in minuscolo)
-    original_columns = df.columns
-    cleaned_df_columns = {col: col.strip().lower() for col in original_columns}
-
-    for standard_name, aliases in alias_map.items():
-        for alias in aliases:
-            cleaned_alias = alias.strip().lower()
-            
-            for original_col, cleaned_col in cleaned_df_columns.items():
-                if cleaned_col == cleaned_alias:
-                    # Se trova una corrispondenza, la mappa per la rinomina
-                    if standard_name not in rename_dict.values():
-                        rename_dict[original_col] = standard_name
-                        break
-            if standard_name in rename_dict.values():
-                break
-                
-    return df.rename(columns=rename_dict)
-
-
 def load_and_normalize(uploaded) -> pd.DataFrame:
     df = _read_data(uploaded)
 
-    # Rimuove eventuali righe completamente vuote
+    # Rimuove eventuali righe completamente vuote che possono essere create da alcuni editor
     df.dropna(how='all', inplace=True)
 
     # Se la prima riga è un header duplicato, la rimuove
-    if "ISIN" in df.columns and len(df) > 0 and isinstance(df.loc[0, "ISIN"], str) and df.loc[0, "ISIN"].strip().upper() == "ISIN":
+    if len(df) > 0 and 'ISIN' in df.columns and isinstance(df.loc[0, 'ISIN'], str) and df.loc[0, 'ISIN'].strip().upper() == 'ISIN':
         df = df.iloc[1:].reset_index(drop=True)
+    
+    # Costruisce una mappa di rinomina robusta (alias -> nome standard)
+    alias_to_standard_map = {}
+    for standard_name, aliases in REQUIRED_COLS_ALIASES.items():
+        for alias in aliases:
+            # Pulisce l'alias per la mappatura (minuscolo, senza spazi)
+            cleaned_alias = alias.strip().lower()
+            alias_to_standard_map[cleaned_alias] = standard_name
+            
+    # Crea il dizionario di rinomina per le colonne del DataFrame
+    rename_dict = {}
+    for col in df.columns:
+        cleaned_col = col.strip().lower()
+        if cleaned_col in alias_to_standard_map:
+            rename_dict[col] = alias_to_standard_map[cleaned_col]
+            
+    df = df.rename(columns=rename_dict)
 
-    df = find_and_rename_columns(df, REQUIRED_COLS_ALIASES)
-
+    # Controlla le colonne mancanti e fornisce un errore dettagliato
     required = ["ISIN", "Issuer", "Maturity", "Currency", "ExchangeName", "ScoreRendimento", "ScoreRischio",
                 "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]
     missing_cols = [c for c in required if c not in df.columns]
     if missing_cols:
-        raise ValueError(f"Colonne obbligatorie mancanti. Colonne trovate nel file: {list(df.columns)}. Colonne mancanti: {', '.join(missing_cols)}")
+        raise ValueError(f"Colonne obbligatorie mancanti. Colonne trovate nel file dopo la pulizia: {list(df.columns)}. Colonne mancanti: {', '.join(missing_cols)}")
 
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
     for col in ["ScoreRendimento", "ScoreRischio", "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]:
