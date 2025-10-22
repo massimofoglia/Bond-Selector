@@ -45,7 +45,7 @@ def _read_data(uploaded) -> pd.DataFrame:
     separator = '\t' if file_name.lower().endswith('.txt') else ','
     # 'utf-8-sig' è cruciale per gestire correttamente il BOM all'inizio del file.
     encodings = ["utf-8-sig", "utf-8", "ISO-8859-1", "latin1", "cp1252"]
-    
+
     for enc in encodings:
         try:
             uploaded.seek(0)
@@ -57,44 +57,64 @@ def _read_data(uploaded) -> pd.DataFrame:
 
 def load_and_normalize(uploaded) -> pd.DataFrame:
     df = _read_data(uploaded)
+    original_columns = list(df.columns) # Memorizza i nomi originali per la diagnostica
 
     # Rimuove eventuali righe e colonne completamente vuote
     df.dropna(how='all', inplace=True)
     df.dropna(how='all', axis=1, inplace=True)
 
     # Se la prima riga è un header duplicato, la rimuove
-    if len(df) > 0 and 'ISIN' in df.columns and isinstance(df.loc[0, 'ISIN'], str) and df.loc[0, 'ISIN'].strip().upper() == 'ISIN':
-        df = df.iloc[1:].reset_index(drop=True)
-    
+    # Pulisce il nome della colonna ISIN prima del controllo
+    df_columns_cleaned_for_check = {col.strip().lower(): col for col in df.columns}
+    isin_standard = 'isin'
+    if isin_standard in df_columns_cleaned_for_check and len(df) > 0:
+        original_isin_col_name = df_columns_cleaned_for_check[isin_standard]
+        if isinstance(df.loc[0, original_isin_col_name], str) and df.loc[0, original_isin_col_name].strip().upper() == 'ISIN':
+            df = df.iloc[1:].reset_index(drop=True)
+
     # Costruisce una mappa di rinomina robusta (alias pulito -> nome standard)
     alias_to_standard_map = {}
     for standard_name, aliases in REQUIRED_COLS_ALIASES.items():
         for alias in aliases:
-            # Pulisce l'alias per la mappatura (minuscolo, senza spazi)
             cleaned_alias = alias.strip().lower()
             alias_to_standard_map[cleaned_alias] = standard_name
-            
-    # Crea il dizionario di rinomina per le colonne del DataFrame
+
+    # Crea il dizionario di rinomina effettivo (nome originale -> nome standard)
     rename_dict = {}
-    for col in df.columns:
-        cleaned_col = col.strip().lower()
+    processed_std_names = set() # Per evitare sovrascritture se più alias puntano allo stesso standard
+    for original_col in df.columns:
+        cleaned_col = original_col.strip().lower()
         if cleaned_col in alias_to_standard_map:
-            # Associa il nome della colonna originale al nome standard
-            if alias_to_standard_map[cleaned_col] not in rename_dict.values():
-                 rename_dict[col] = alias_to_standard_map[cleaned_col]
-            
-    df = df.rename(columns=rename_dict)
+            standard_name = alias_to_standard_map[cleaned_col]
+            # Associa il nome originale al nome standard solo se non già mappato
+            if standard_name not in processed_std_names:
+                 rename_dict[original_col] = standard_name
+                 processed_std_names.add(standard_name) # Segna questo nome standard come processato
+
+    df_renamed = df.rename(columns=rename_dict)
+    renamed_columns = list(df_renamed.columns) # Colonne dopo il tentativo di rinomina
 
     # Controlla le colonne mancanti e fornisce un errore dettagliato
     required = ["ISIN", "Issuer", "Maturity", "Currency", "ExchangeName", "ScoreRendimento", "ScoreRischio",
                 "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]
-    missing_cols = [c for c in required if c not in df.columns]
+    missing_cols = [c for c in required if c not in df_renamed.columns]
     if missing_cols:
-        raise ValueError(f"Colonne obbligatorie mancanti. Colonne trovate nel file dopo la pulizia: {list(df.columns)}. Colonne mancanti: {', '.join(missing_cols)}")
+        raise ValueError(
+            f"**ERRORE: Colonne obbligatorie mancanti.**\n\n"
+            f"**Colonne originali lette dal file:**\n`{original_columns}`\n\n"
+            f"**Colonne trovate dopo il tentativo di rinomina:**\n`{renamed_columns}`\n\n"
+            f"**Colonne richieste ma non trovate:**\n`{', '.join(missing_cols)}`\n\n"
+            f"**Verifica che i nomi nel tuo file corrispondano agli alias previsti (es. 'ISO Currency' per Currency).**"
+        )
 
+    # --- Da qui in poi il codice rimane invariato ---
+    df = df_renamed # Usa il dataframe rinominato per il resto delle operazioni
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
     for col in ["ScoreRendimento", "ScoreRischio", "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]:
-        df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
+        try:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
+        except Exception as e:
+            raise ValueError(f"Errore nella conversione numerica della colonna '{col}': {e}. Controlla i dati.")
 
     if "IssuerType" not in df.columns: df["IssuerType"] = df.get("Comparto", pd.Series(dtype=str)).astype(str).map(_infer_issuer_type)
     if "Sector" not in df.columns: df["Sector"] = np.where(df["IssuerType"].str.contains("Govt", case=False, na=False), "Government", "Unknown")
@@ -108,6 +128,10 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
 
     for c in ["Valuta", "TipoEmittente", "Settore", "Scadenza", "Issuer", "ExchangeName"]:
         if c in df.columns: df[c] = df[c].fillna("Unknown").astype(str)
+
+    critical_numeric_cols = ["MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement", "ScoreRendimento", "ScoreRischio"]
+    if df[critical_numeric_cols].isnull().any().any():
+         st.warning("Attenzione: Alcune colonne numeriche essenziali contengono valori mancanti o non validi dopo la conversione. Le righe con valori mancanti verranno escluse.")
 
     return df.dropna(subset=required).reset_index(drop=True)
 
@@ -389,15 +413,20 @@ if uploaded:
                     st.error(f"Si è verificato un errore inatteso: {e}")
 
     except Exception as e:
-        # --- NUOVO BLOCCO DI ERRORE CON DIAGNOSTICA ---
+        # --- BLOCCO DI ERRORE CON DIAGNOSTICA DETTAGLIATA ---
         exc_type, exc_obj, exc_tb = sys.exc_info()
-        line_num = exc_tb.tb_lineno
+        line_num = exc_tb.tb_lineno if exc_tb else 'N/A'
+        # Estrae lo stack trace per più contesto
+        tb_details = traceback.format_exception(exc_type, exc_obj, exc_tb)
+        
         error_message = (
-            f"**Si è verificato un errore:** {e}\n\n"
-            f"**Tipo di errore:** `{exc_type.__name__}`\n\n"
-            f"**Punto critico nel codice:** Riga `{line_num}`\n\n"
-            "**Causa probabile:** C'è un'incongruenza nel formato del file caricato che impedisce al programma di riconoscere correttamente le colonne. "
-            "Controlla che i nomi delle colonne nel tuo file corrispondano esattamente a quelli attesi (es. 'ISO Currency', 'Ask Price', etc.) e che non ci siano caratteri anomali."
+            f"**Si è verificato un errore nel caricamento o nella normalizzazione del file:**\n\n"
+            f"**Tipo di errore:** `{exc_type.__name__}`\n"
+            f"**Messaggio:** `{str(e)}`\n"
+            f"**Punto critico nel codice (approssimativo):** Riga `{line_num}`\n\n"
+            f"**Stack Trace (dettagli tecnici):**\n```\n{''.join(tb_details)}\n```\n\n"
+            "**Causa probabile:** Potrebbe esserci un'incongruenza nel formato del file (caratteri speciali, separatori non corretti, BOM imprevisto) "
+            "o un problema nella mappatura dei nomi delle colonne. Controlla il messaggio di errore specifico e la lista delle colonne trovate (se presente nell'errore `ValueError`) per identificare il problema."
         )
         st.error(error_message)
-        # --- FINE NUOVO BLOCCO ---
+        # --- FINE BLOCCO ---
