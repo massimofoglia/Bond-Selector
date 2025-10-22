@@ -43,72 +43,94 @@ def _read_data(uploaded) -> pd.DataFrame:
     """
     file_name = uploaded.name
     separator = '\t' if file_name.lower().endswith('.txt') else ','
-    # 'utf-8-sig' è cruciale per gestire correttamente il BOM all'inizio del file.
     encodings = ["utf-8-sig", "utf-8", "ISO-8859-1", "latin1", "cp1252"]
 
     for enc in encodings:
         try:
             uploaded.seek(0)
-            # engine='python' è più robusto con separatori complessi e caratteri anomali
-            return pd.read_csv(uploaded, sep=separator, encoding=enc, engine='python')
+            return pd.read_csv(uploaded, sep=separator, encoding=enc, engine='python', skipinitialspace=True)
         except Exception:
             continue
     raise ValueError("Impossibile leggere il file. Prova a salvarlo nuovamente in formato UTF-8.")
 
+def clean_col_name(col_name: str) -> str:
+    """ Pulisce il nome di una colonna rimuovendo caratteri non alfanumerici e convertendo in minuscolo."""
+    if not isinstance(col_name, str):
+        return ""
+    # Rimuove spazi iniziali/finali, converte in minuscolo, rimuove caratteri non alfanumerici
+    cleaned = re.sub(r'[^a-z0-9]+', '', col_name.strip().lower())
+    return cleaned
+
 def load_and_normalize(uploaded) -> pd.DataFrame:
     df = _read_data(uploaded)
-    original_columns = list(df.columns) # Memorizza i nomi originali per la diagnostica
+    original_columns = list(df.columns)
 
-    # Rimuove eventuali righe e colonne completamente vuote
+    # Rimuove righe/colonne vuote
     df.dropna(how='all', inplace=True)
     df.dropna(how='all', axis=1, inplace=True)
 
-    # Se la prima riga è un header duplicato, la rimuove
-    # Pulisce il nome della colonna ISIN prima del controllo
-    df_columns_cleaned_for_check = {col.strip().lower(): col for col in df.columns}
-    isin_standard = 'isin'
-    if isin_standard in df_columns_cleaned_for_check and len(df) > 0:
-        original_isin_col_name = df_columns_cleaned_for_check[isin_standard]
-        if isinstance(df.loc[0, original_isin_col_name], str) and df.loc[0, original_isin_col_name].strip().upper() == 'ISIN':
+    # Rimuove header duplicato (controllando nome colonna pulito)
+    df_columns_cleaned_for_check = {clean_col_name(col): col for col in df.columns}
+    isin_cleaned = 'isin'
+    if isin_cleaned in df_columns_cleaned_for_check and len(df) > 0:
+        original_isin_col_name = df_columns_cleaned_for_check[isin_cleaned]
+        if isinstance(df.iloc[0][original_isin_col_name], str) and df.iloc[0][original_isin_col_name].strip().upper() == 'ISIN':
             df = df.iloc[1:].reset_index(drop=True)
 
-    # Costruisce una mappa di rinomina robusta (alias pulito -> nome standard)
+    # Costruisce mappa alias pulito -> nome standard
     alias_to_standard_map = {}
     for standard_name, aliases in REQUIRED_COLS_ALIASES.items():
         for alias in aliases:
-            cleaned_alias = alias.strip().lower()
+            cleaned_alias = clean_col_name(alias)
             alias_to_standard_map[cleaned_alias] = standard_name
 
-    # Crea il dizionario di rinomina effettivo (nome originale -> nome standard)
+    # Crea dizionario di rinomina (originale -> standard) con controllo conflitti
     rename_dict = {}
-    processed_std_names = set() # Per evitare sovrascritture se più alias puntano allo stesso standard
+    standard_name_assignments = {} # Tiene traccia di quale colonna originale è stata mappata a quale nome standard
+    cleaned_original_cols = {} # Mappa nome pulito -> nome originale
+    
     for original_col in df.columns:
-        cleaned_col = original_col.strip().lower()
+        cleaned_col = clean_col_name(original_col)
+        cleaned_original_cols[cleaned_col] = original_col # Salva la corrispondenza
+        
         if cleaned_col in alias_to_standard_map:
-            standard_name = alias_to_standard_map[cleaned_col]
-            # Associa il nome originale al nome standard solo se non già mappato
-            if standard_name not in processed_std_names:
-                 rename_dict[original_col] = standard_name
-                 processed_std_names.add(standard_name) # Segna questo nome standard come processato
+            target_standard_name = alias_to_standard_map[cleaned_col]
+            
+            # Controllo conflitti: questo nome standard è già stato assegnato a un'altra colonna?
+            if target_standard_name in standard_name_assignments and standard_name_assignments[target_standard_name] != original_col:
+                 raise ValueError(
+                     f"**ERRORE: Conflitto nella mappatura delle colonne!**\n\n"
+                     f"Sia la colonna originale '{standard_name_assignments[target_standard_name]}' che la colonna '{original_col}' "
+                     f"corrispondono entrambe al nome standard richiesto '{target_standard_name}'.\n"
+                     f"Verifica le intestazioni nel tuo file per eliminare duplicati o alias ambigui."
+                 )
+            
+            # Se non c'è conflitto o è la stessa colonna che mappa di nuovo (improbabile ma sicuro), assegna
+            if target_standard_name not in standard_name_assignments.values():
+                 rename_dict[original_col] = target_standard_name
+                 standard_name_assignments[target_standard_name] = original_col # Registra l'assegnazione
 
     df_renamed = df.rename(columns=rename_dict)
-    renamed_columns = list(df_renamed.columns) # Colonne dopo il tentativo di rinomina
+    renamed_columns = list(df_renamed.columns)
 
-    # Controlla le colonne mancanti e fornisce un errore dettagliato
+    # Controllo finale colonne mancanti con diagnostica dettagliata
     required = ["ISIN", "Issuer", "Maturity", "Currency", "ExchangeName", "ScoreRendimento", "ScoreRischio",
                 "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]
     missing_cols = [c for c in required if c not in df_renamed.columns]
     if missing_cols:
+        # Crea una mappa di diagnostica: nome pulito originale -> nome originale
+        diagnostic_cleaned_cols = {clean_col_name(orig): orig for orig in original_columns}
         raise ValueError(
-            f"**ERRORE: Colonne obbligatorie mancanti.**\n\n"
-            f"**Colonne originali lette dal file:**\n`{original_columns}`\n\n"
-            f"**Colonne trovate dopo il tentativo di rinomina:**\n`{renamed_columns}`\n\n"
+            f"**ERRORE: Colonne obbligatorie mancanti dopo il tentativo di mappatura.**\n\n"
+            f"**Colonne originali lette:**\n`{original_columns}`\n\n"
+            f"**Nomi colonne puliti (usati per mappatura):**\n`{diagnostic_cleaned_cols}`\n\n"
+            f"**Mappatura applicata (Originale -> Standard):**\n`{rename_dict}`\n\n"
+            f"**Colonne risultanti dopo rinomina:**\n`{renamed_columns}`\n\n"
             f"**Colonne richieste ma non trovate:**\n`{', '.join(missing_cols)}`\n\n"
-            f"**Verifica che i nomi nel tuo file corrispondano agli alias previsti (es. 'ISO Currency' per Currency).**"
+            f"**Verifica la mappatura e i nomi nel tuo file.** L'errore indica che una o più colonne richieste non sono state trovate o mappate correttamente."
         )
 
-    # --- Da qui in poi il codice rimane invariato ---
-    df = df_renamed # Usa il dataframe rinominato per il resto delle operazioni
+    df = df_renamed # Prosegui con il dataframe rinominato
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
     for col in ["ScoreRendimento", "ScoreRischio", "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]:
         try:
@@ -426,7 +448,7 @@ if uploaded:
             f"**Punto critico nel codice (approssimativo):** Riga `{line_num}`\n\n"
             f"**Stack Trace (dettagli tecnici):**\n```\n{''.join(tb_details)}\n```\n\n"
             "**Causa probabile:** Potrebbe esserci un'incongruenza nel formato del file (caratteri speciali, separatori non corretti, BOM imprevisto) "
-            "o un problema nella mappatura dei nomi delle colonne. Controlla il messaggio di errore specifico e la lista delle colonne trovate (se presente nell'errore `ValueError`) per identificare il problema."
+            "o un problema nella mappatura dei nomi delle colonne. Controlla il messaggio di errore specifico (`ValueError` conterrà dettagli sulle colonne) per identificare il problema."
         )
         st.error(error_message)
         # --- FINE BLOCCO ---
