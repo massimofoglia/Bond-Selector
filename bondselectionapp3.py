@@ -35,7 +35,6 @@ REQUIRED_COLS_ALIASES = {
     "AccruedInterest": ["AccruedInterest", "Accrued Interest", "Rateo"],
     "DenominationMinimum": ["DenominationMinimum", "Denomination Minimum", "Lotto Minimo"],
     "DenominationIncrement": ["DenominationIncrement", "Denomination Increment", "Lotto Incremento"],
-    # NUOVE COLONNE PER GRAFICO SCATTER
     "ModifiedDuration": ["Modified Duration", "DURATION", "Mod Dur"],
     "AskYield": ["Ask Yield", "YIELD Ask", "AskYld"],
 }
@@ -73,7 +72,6 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     isin_cleaned = 'isin'
     if isin_cleaned in df_columns_cleaned_for_check and len(df) > 0:
         original_isin_col_name = df_columns_cleaned_for_check[isin_cleaned]
-        # Controllo robusto per header duplicato
         first_isin_val = df.iloc[0][original_isin_col_name]
         if isinstance(first_isin_val, str) and first_isin_val.strip().upper() == 'ISIN':
             df = df.iloc[1:].reset_index(drop=True)
@@ -111,10 +109,9 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"Errore durante l'applicazione della rinomina: {e}")
 
-    # Aggiorna required_standard_names per includere le nuove colonne
     required_standard_names = ["ISIN", "Issuer", "Maturity", "Currency", "ExchangeName", "ScoreRendimento", "ScoreRischio",
                                "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement",
-                               "ModifiedDuration", "AskYield"] # AGGIUNTO ModifiedDuration, AskYield
+                               "ModifiedDuration", "AskYield"]
     current_columns_set = set(df_renamed.columns)
     missing_after_rename = [c for c in required_standard_names if c not in current_columns_set]
 
@@ -132,7 +129,6 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
     df = df_renamed
 
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
-    # Aggiorna lista conversione numerica
     numeric_cols = ["ScoreRendimento", "ScoreRischio", "MarketPrice", "AccruedInterest",
                     "DenominationMinimum", "DenominationIncrement", "ModifiedDuration", "AskYield"]
     for col in numeric_cols:
@@ -140,30 +136,35 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
             if col in df.columns:
                  df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
             else:
-                 raise ValueError(f"Colonna '{col}' mancante prima della conversione numerica.")
+                 raise ValueError(f"Colonna '{col}' mancante.")
         except Exception as e:
-            raise ValueError(f"Errore nella conversione numerica della colonna '{col}': {e}. Controlla i dati.")
+            raise ValueError(f"Errore nella conversione numerica della colonna '{col}': {e}.")
 
     critical_cols_check = required_standard_names + ["Maturity"]
     rows_before_dropna = len(df)
+    # Rimuovi righe con NaN nelle colonne critiche *prima* di ulteriori calcoli
     df.dropna(subset=critical_cols_check, inplace=True)
     rows_after_dropna = len(df)
     if rows_before_dropna > rows_after_dropna:
-        st.warning(f"{rows_before_dropna - rows_after_dropna} righe sono state rimosse a causa di valori mancanti nelle colonne richieste.")
+        st.warning(f"{rows_before_dropna - rows_after_dropna} righe rimosse per valori mancanti nelle colonne critiche.")
 
+    # Calcoli e rinomine successive
     if "IssuerType" not in df.columns: df["IssuerType"] = df.get("Comparto", pd.Series(dtype=str)).astype(str).map(_infer_issuer_type)
     if "Sector" not in df.columns: df["Sector"] = np.where(df["IssuerType"].str.contains("Govt", case=False, na=False), "Government", "Unknown")
 
     df = df.rename(columns={"Currency": "Valuta", "IssuerType": "TipoEmittente", "Sector": "Settore"})
 
     today = pd.Timestamp.today().normalize()
-    try:
-        df["YearsToMaturity"] = (df["Maturity"] - today).dt.days / 365.25
-    except TypeError:
-        df["YearsToMaturity"] = pd.NA
+    # Calcola YearsToMaturity solo se Maturity è valida
+    if pd.api.types.is_datetime64_any_dtype(df["Maturity"]):
+         df["YearsToMaturity"] = (df["Maturity"] - today).dt.days / 365.25
+    else:
+         df["YearsToMaturity"] = pd.NA
 
     df["Scadenza"] = df["YearsToMaturity"].apply(lambda y: "Short" if y <= 3 else ("Medium" if y <= 7 else "Long") if pd.notna(y) else "Unknown")
-    df["Settore"] = df["Settore"].apply(_map_sector)
+    # Applica map_sector sulla colonna 'Settore' (rinominata)
+    if "Settore" in df.columns:
+        df["Settore"] = df["Settore"].apply(_map_sector)
 
     for c in ["Valuta", "TipoEmittente", "Settore", "Scadenza", "Issuer", "ExchangeName"]:
         if c in df.columns: df[c] = df[c].fillna("Unknown").astype(str)
@@ -205,7 +206,12 @@ def integer_targets_from_weights(n: int, weights: Dict[str, float]) -> Dict[str,
     sorted_remainders = sorted(remainders.items(), key=lambda item: item[1], reverse=True)
     remaining_n = n - sum(floor_counts.values())
 
+    # Assicura che remaining_n non sia negativo (può succedere con arrotondamenti)
+    remaining_n = max(0, remaining_n)
+
     for i in range(remaining_n):
+        # Evita IndexError se sorted_remainders è vuoto
+        if not sorted_remainders: break
         key_to_increment = sorted_remainders[i % len(sorted_remainders)][0]
         floor_counts[key_to_increment] += 1
 
@@ -221,6 +227,9 @@ def _solve_and_get_status(prob, solver):
 
 def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec, targ_mat, weighting_scheme: str) -> pd.DataFrame:
     if pulp is None: raise RuntimeError("La libreria PuLP non è installata.")
+    if n <= 0: raise ValueError("Il numero di titoli (n) deve essere maggiore di 0.")
+    if df.empty: raise ValueError("L'universo investibile fornito è vuoto.")
+
 
     prob = pulp.LpProblem("bond_selection", pulp.LpMaximize)
     df_copy = df.reset_index(drop=True)
@@ -261,7 +270,12 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     status = pulp.LpStatus[status_code]
     if status == "Optimal":
         chosen_indices = [i for i in indices if x[i].varValue is not None and x[i].varValue > 0.5]
+        # Controllo ulteriore se il numero di titoli scelti non corrisponde a n
+        if len(chosen_indices) != n:
+             st.warning(f"Solver ottimale ma ha selezionato {len(chosen_indices)} titoli invece di {n}. Possibile problema numerico.")
+             # Potrebbe essere necessario restituire comunque, o gestire diversamente
         return df_copy.loc[chosen_indices].reset_index(drop=True)
+
     else:
         details = ""
         if status == "Infeasible":
@@ -290,23 +304,53 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
          normalized_weights = pd.Series([1/n] * n, index=portfolio.index)
     else:
          normalized_weights = rounded_weights / rounded_weights.sum()
-
+         
+    # ---- NUOVO: Limite massimo peso target ----
+    max_weight_limit = (1 / n) * 2.5
+    exceeding_cap = normalized_weights > max_weight_limit
+    
+    # Se ci sono pesi che superano il cap, ridistribuisci l'eccesso
+    total_excess = (normalized_weights[exceeding_cap] - max_weight_limit).sum()
+    if total_excess > 0:
+        normalized_weights[exceeding_cap] = max_weight_limit # Applica il cap
+        # Redistribuisci l'eccesso proporzionalmente ai titoli sotto il cap
+        weights_below_cap = normalized_weights[~exceeding_cap]
+        if weights_below_cap.sum() > 0: # Evita divisione per zero se tutti sono al cap
+            normalized_weights[~exceeding_cap] += weights_below_cap * (total_excess / weights_below_cap.sum())
+        elif n > 0: # Se tutti i pesi erano sopra il cap, li forziamo a EW
+             normalized_weights = pd.Series([1/n] * n, index=portfolio.index)
+             
     portfolio['target_weight'] = normalized_weights
     portfolio['target_capital'] = portfolio['target_weight'] * total_capital
+    # ---- FINE NUOVO: Limite massimo peso target ----
+
 
     portfolio = portfolio.assign(**{"Valore Nominale (€)": 0.0, "Controvalore di Mercato (€)": 0.0})
 
     capital_allocated = 0
-    # CORREZIONE 2: Assicura investimento nominale minimo >= 1000
-    min_nominal_floor = 1000
+    min_nominal_floor = 1000 # CORREZIONE 2
+
+    # --- NUOVO: Check preliminare fattibilità lotto minimo ---
+    min_total_investment = 0
+    for idx, row in portfolio.iterrows():
+         min_nominal_data = row['DenominationMinimum'] if pd.notna(row['DenominationMinimum']) else min_nominal_floor
+         effective_min_nominal = max(min_nominal_floor, min_nominal_data)
+         market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100
+         accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
+         market_value_per_unit = (market_price + accrued) / 100
+         min_total_investment += effective_min_nominal * market_value_per_unit
+    
+    if min_total_investment > total_capital:
+         raise ValueError(f"Capitale ({total_capital:,.0f}€) insufficiente per investimento minimo richiesto ({min_total_investment:,.0f}€) nei {n} titoli selezionati. Riduci il numero di titoli o aumenta il capitale.")
+    # --- FINE CHECK ---
+
 
     for idx, row in portfolio.iterrows():
         min_nominal_data = row['DenominationMinimum'] if pd.notna(row['DenominationMinimum']) else min_nominal_floor
-        effective_min_nominal = max(min_nominal_floor, min_nominal_data)
+        effective_min_nominal = max(min_nominal_floor, min_nominal_data) # Applica floor 1000
 
         market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100
         accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
-        # CORREZIONE 3 (Formula peso): Calcola correttamente il market value
         market_value_per_unit = (market_price + accrued) / 100
         min_market_value = effective_min_nominal * market_value_per_unit
 
@@ -315,54 +359,63 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
         capital_allocated += min_market_value
 
     capital_remaining = total_capital - capital_allocated
-    if capital_remaining < 0:
-        st.warning(f"Capitale ({total_capital:,.0f}€) insufficiente per investimento minimo ({capital_allocated:,.0f}€). Allocazione basata solo sul minimo.")
-        capital_remaining = 0
+    # Non dovrebbe essere negativo grazie al check, ma per sicurezza
+    capital_remaining = max(0, capital_remaining)
 
     # CORREZIONE 3: Allocazione più aggressiva
     if capital_remaining > 0:
-        portfolio.sort_values(by='target_capital', ascending=False, inplace=True)
+        # Ordina per differenza CAPITALE ASSOLUTA (target - current)
+        portfolio['capital_diff_abs'] = portfolio['target_capital'] - portfolio['Controvalore di Mercato (€)']
+        portfolio.sort_values(by='capital_diff_abs', ascending=False, inplace=True)
+
         can_allocate_more = True
         while capital_remaining > 1 and can_allocate_more: # Tolleranza 1€
             allocated_in_iteration = False
-            # Crea una copia dell'indice per iterare in modo sicuro mentre si modifica il DataFrame
-            indices_to_iterate = portfolio.index.tolist()
+            indices_to_iterate = portfolio.index.tolist() # Itera sull'ordine corrente
+
             for idx in indices_to_iterate:
-                 # Rileggi la riga aggiornata dal DataFrame
                  row = portfolio.loc[idx]
-                 # CORREZIONE: Usa max(100, increment) per DenominationIncrement < 100
-                 increment_nominal_data = row['DenominationIncrement'] if pd.notna(row['DenominationIncrement']) and row['DenominationIncrement'] > 0 else 1000 # Default robusto
+                 # CORREZIONE 1 (utente successivo): Usa max(100, increment)
+                 increment_nominal_data = row['DenominationIncrement'] if pd.notna(row['DenominationIncrement']) and row['DenominationIncrement'] > 0 else 1000
                  effective_increment_nominal = max(100, increment_nominal_data) # Applica floor di 100
 
                  market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100
                  accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
-                 # CORREZIONE 3 (Formula peso): Calcola correttamente il market value
                  market_value_per_unit = (market_price + accrued) / 100
                  increment_market_value = effective_increment_nominal * market_value_per_unit
 
                  if increment_market_value <= 0: continue
 
-                 # Allocca se c'è capitale E se siamo sotto il target
-                 current_capital = portfolio.loc[idx, 'Controvalore di Mercato (€)']
-                 target_cap = portfolio.loc[idx, 'target_capital']
-                 if capital_remaining >= increment_market_value and current_capital < target_cap :
+                 # Allocca se c'è capitale E se siamo sotto il target E se non superiamo il capitale totale!
+                 current_capital_pos = portfolio.loc[idx, 'Controvalore di Mercato (€)']
+                 target_cap_pos = portfolio.loc[idx, 'target_capital']
+
+                 # Controlla se l'incremento supererebbe il target o il capitale totale
+                 would_exceed_target = (current_capital_pos + increment_market_value) > target_cap_pos
+                 can_afford = capital_remaining >= increment_market_value
+
+                 if can_afford : #and not would_exceed_target: # Rimuovi controllo target per usare più capitale
                       portfolio.loc[idx, 'Valore Nominale (€)'] += effective_increment_nominal
                       portfolio.loc[idx, 'Controvalore di Mercato (€)'] += increment_market_value
                       capital_remaining -= increment_market_value
                       allocated_in_iteration = True
-                      # Non riordinare qui, completa il giro per dare chance agli altri
+                      # Ricalcola diff per il riordino nel prossimo ciclo while
+                      portfolio.loc[idx, 'capital_diff_abs'] = portfolio.loc[idx, 'target_capital'] - portfolio.loc[idx, 'Controvalore di Mercato (€)']
+
+
+            # Riordina DOPO aver tentato di allocare su tutti i titoli in questo giro
+            portfolio.sort_values(by='capital_diff_abs', ascending=False, inplace=True)
 
             if not allocated_in_iteration:
-                 can_allocate_more = False # Nessun titolo ha potuto ricevere capitale in questo giro
+                 can_allocate_more = False # Stop se nessun incremento è stato possibile
 
-    # CORREZIONE 3 (Formula peso): Calcola peso finale basato su Controvalore di Mercato
     total_market_value = portfolio['Controvalore di Mercato (€)'].sum()
     if total_market_value > 0:
         portfolio['Peso (%)'] = (portfolio['Controvalore di Mercato (€)'] / total_market_value) * 100
     else:
          portfolio['Peso (%)'] = 0.0
 
-    return portfolio.drop(columns=['target_weight', 'target_capital'], errors='ignore')
+    return portfolio.drop(columns=['target_weight', 'target_capital', 'capital_diff_abs'], errors='ignore')
 
 
 st.set_page_config(page_title="Bond Portfolio Selector", layout="wide")
@@ -420,35 +473,35 @@ if uploaded:
 
         w_val, w_iss, w_sec, w_mat = {}, {}, {}, {}
 
-        # CORREZIONE 4: Logica corretta per mappare titolo UI a nome colonna
+        # CORREZIONE 4: Passa l'universo CORRENTE per filtrare le opzioni UI
         def get_weights_from_user_ui(title, col_name_ui, df_source, universe_current, key_prefix):
-            st.subheader(title) # Titolo aggiunto
+            st.subheader(title) # CORREZIONE 2: Titolo aggiunto
             options = sorted(df_source[col_name_ui].unique())
-            # Mostra input solo per opzioni presenti nell'universo corrente
-            valid_options_in_universe = sorted(universe_current[col_name_ui].unique())
+            # Filtra le opzioni visualizzate in base all'universo corrente
+            valid_options_in_universe = sorted(universe_current[col_name_ui].unique()) if col_name_ui in universe_current else []
 
-            if not valid_options_in_universe:
+            if not valid_options_in_universe and options:
                  #st.warning(f"Nessun titolo nell'universo corrente appartiene alle categorie di '{title}'.")
-                 return {} # Non mostrare input se nessuna opzione è valida
+                 # Mostra comunque tutte le opzioni per permettere l'input
+                 valid_options_to_show = options
+            elif not options:
+                 #st.warning(f"Nessuna categoria trovata per '{title}' nel file caricato.")
+                 return {}
+            else:
+                 valid_options_to_show = valid_options_in_universe # Mostra solo quelle presenti
 
-            # Mostra gli input solo per le opzioni valide nell'universo
-            weights = {}
-            for opt in valid_options_in_universe:
-                 weights[opt] = st.number_input(f"{opt} (%)", 0.0, 100.0, 0.0, key=f"{key_prefix}_{opt}")
-            return weights
-
+            return {opt: st.number_input(f"{opt} (%)", 0.0, 100.0, 0.0, key=f"{key_prefix}_{opt}") for opt in valid_options_to_show}
 
         cols = st.columns(2)
         with cols[0]:
-            # Passa l'universo corrente per filtrare le opzioni visualizzate
             if use_val: w_val = get_weights_from_user_ui("Pesi per Valuta", "Valuta", df, universe, "val")
-            if use_iss: w_iss = get_weights_from_user_ui("Pesi per Tipo Emittente", "TipoEmittente", df, universe, "iss")
+            if use_iss: w_iss = get_weights_from_user_ui("Pesi per Tipo Emittente", "TipoEmittente", df, universe, "iss") # CORREZIONE 4: Usa nome colonna corretto
         with cols[1]:
             if use_sec:
-                st.subheader("Pesi per Settore") # Titolo aggiunto
+                st.subheader("Pesi per Settore") # CORREZIONE 2
                 w_sec = {opt: st.number_input(f"{opt} (%)", 0.0, 100.0, 0.0, key=f"sec_{opt}") for opt in ["Govt", "Financials", "Non Financials"]}
             if use_mat:
-                st.subheader("Pesi per Scadenza") # Titolo aggiunto
+                st.subheader("Pesi per Scadenza") # CORREZIONE 2
                 w_mat = {opt: st.number_input(f"{opt} (%)", 0.0, 100.0, 0.0, key=f"mat_{opt}") for opt in ["Short", "Medium", "Long"]}
 
 
@@ -469,72 +522,82 @@ if uploaded:
         if st.button("Costruisci Portafoglio"):
             if not is_valid: st.stop()
             if universe.empty:
-                st.error("L'universo investibile è vuoto. Prova a modificare i filtri.")
+                st.error("L'universo investibile è vuoto.")
                 st.stop()
 
             if n > len(universe):
-                st.warning(f"Numero titoli richiesti ({n}) > disponibili ({len(universe)}). Seleziono {len(universe)} titoli.")
+                st.warning(f"N titoli ({n}) > disponibili ({len(universe)}). Seleziono {len(universe)}.")
                 n_effettivo = len(universe)
             else:
                  n_effettivo = n
 
             if n_effettivo <= 0:
-                 st.error("Il numero di titoli da selezionare deve essere > 0.")
+                 st.error("N titoli deve essere > 0.")
                  st.stop()
 
-            with st.spinner("Ottimizzazione e allocazione in corso..."):
+            with st.spinner("Ottimizzazione e allocazione..."):
                 try:
                     portfolio_selection = build_portfolio_milp(universe, n_effettivo, w_val, w_iss, w_sec, w_mat, weighting_scheme)
                     portfolio = calculate_capital_allocation(portfolio_selection, total_capital, weighting_scheme, n_effettivo)
                     st.success("Portafoglio generato!")
 
-                    # CORREZIONE 1: Imposta indice da 1
+                    # CORREZIONE 1: Indice da 1
                     portfolio_display = portfolio.copy()
                     portfolio_display.index = np.arange(1, len(portfolio_display) + 1)
 
                     cols_order = ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)'] + [c for c in portfolio.columns if c not in ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)']]
                     portfolio_display = portfolio_display[cols_order]
 
-                    # Formattazione numeri dopo aver ordinato le colonne
                     for col in ['Valore Nominale (€)', 'Controvalore di Mercato (€)']:
-                         # Gestisci NaN prima della formattazione
-                         portfolio_display[col] = pd.to_numeric(portfolio_display[col], errors='coerce').fillna(0).map('{:,.0f}'.format)
-                    portfolio_display['Peso (%)'] = pd.to_numeric(portfolio_display['Peso (%)'], errors='coerce').fillna(0).map('{:.2f}%'.format)
-
+                         portfolio_display[col] = pd.to_numeric(portfolio[col], errors='coerce').fillna(0).map('{:,.0f}'.format) # Usa portfolio originale per formattare
+                    portfolio_display['Peso (%)'] = pd.to_numeric(portfolio['Peso (%)'], errors='coerce').fillna(0).map('{:.2f}%'.format)
 
                     st.dataframe(portfolio_display)
 
                     st.subheader("Riepilogo Allocazione Capitale")
                     invested_capital = portfolio['Controvalore di Mercato (€)'].sum()
                     remaining_capital = total_capital - invested_capital
-                    # CORREZIONE 3: Messaggio migliorato per capitale non allocato
-                    if remaining_capital > max(1, total_capital * 0.0001): # Soglia 1€ o 0.01%
+                    # CORREZIONE 3: Messaggio migliorato
+                    if remaining_capital > max(1, total_capital * 0.001): # Soglia 1€ o 0.1%
                         st.metric("Capitale Investito", f"€ {invested_capital:,.2f}", f"€ {remaining_capital:,.2f} non allocato (causa lotti)")
                     else:
                          st.metric("Capitale Investito", f"€ {invested_capital:,.2f}", f"€ {remaining_capital:,.2f} non allocato")
 
                     # --- Grafico Scatter Duration/Yield ---
                     st.subheader("Posizionamento Rischio/Rendimento Portafoglio")
-                    fig_scatter, ax_scatter = plt.subplots()
+                    fig_scatter, ax_scatter = plt.subplots(figsize=(10, 6)) # Aumenta dimensione
 
-                    # Calcola media ponderata portafoglio (usa pesi numerici prima della formattazione)
-                    weights_num = portfolio['Peso (%)'] / 100
-                    portfolio_avg_duration = (portfolio['ModifiedDuration'] * weights_num).sum()
-                    portfolio_avg_yield = (portfolio['AskYield'] * weights_num).sum()
+                    # Assicurati che le colonne esistano prima di plottare
+                    if 'ModifiedDuration' in universe.columns and 'AskYield' in universe.columns and \
+                       'ModifiedDuration' in portfolio.columns and 'AskYield' in portfolio.columns:
 
-                    # Grafico
-                    ax_scatter.scatter(universe['ModifiedDuration'], universe['AskYield'], alpha=0.2, label='Universo Investibile', s=20)
-                    ax_scatter.scatter(portfolio['ModifiedDuration'], portfolio['AskYield'], color='red', label='Portafoglio Selezionato', s=40)
-                    ax_scatter.scatter(portfolio_avg_duration, portfolio_avg_yield, color='blue', marker='*', s=200, label='Media Portafoglio', zorder=5) # zorder per portarlo sopra
+                        # Calcola media ponderata portafoglio (usa pesi numerici)
+                        weights_num = portfolio['Peso (%)'] / 100
+                        # Gestisci NaN nei calcoli delle medie
+                        portfolio_avg_duration = (portfolio['ModifiedDuration'].fillna(0) * weights_num).sum() if not weights_num.empty else 0
+                        portfolio_avg_yield = (portfolio['AskYield'].fillna(0) * weights_num).sum() if not weights_num.empty else 0
 
-                    ax_scatter.set_xlabel('Modified Duration')
-                    ax_scatter.set_ylabel('Ask Yield (%)')
-                    ax_scatter.set_title('Posizionamento Rischio (Duration) vs Rendimento (Yield)')
-                    ax_scatter.legend()
-                    ax_scatter.grid(True, linestyle='--', alpha=0.6)
-                    st.pyplot(fig_scatter)
+
+                        ax_scatter.scatter(universe['ModifiedDuration'], universe['AskYield'], alpha=0.2, label='Universo Investibile', s=30, color='grey')
+                        ax_scatter.scatter(portfolio['ModifiedDuration'], portfolio['AskYield'], color='red', label='Portafoglio Selezionato', s=50)
+                        # Etichetta i punti del portafoglio con ISIN (se sono pochi)
+                        if len(portfolio) <= 15:
+                             for i, txt in enumerate(portfolio['ISIN']):
+                                  ax_scatter.annotate(txt, (portfolio['ModifiedDuration'].iloc[i], portfolio['AskYield'].iloc[i]), fontsize=7, alpha=0.8)
+
+                        # Stella per la media ponderata
+                        if portfolio_avg_duration > 0 or portfolio_avg_yield > 0: # Plotta solo se i valori sono sensati
+                           ax_scatter.scatter(portfolio_avg_duration, portfolio_avg_yield, color='blue', marker='*', s=250, label='Media Ponderata Portafoglio', zorder=10)
+
+                        ax_scatter.set_xlabel('Modified Duration')
+                        ax_scatter.set_ylabel('Ask Yield (%)')
+                        ax_scatter.set_title('Posizionamento Rischio (Duration) vs Rendimento (Yield)')
+                        ax_scatter.legend()
+                        ax_scatter.grid(True, linestyle='--', alpha=0.6)
+                        st.pyplot(fig_scatter)
+                    else:
+                        st.warning("Colonne 'Modified Duration' o 'Ask Yield' mancanti per generare il grafico scatter.")
                     # --- Fine Grafico Scatter ---
-
 
                     st.subheader("Distribuzione Pesi del Portafoglio")
                     fig_pie, ax_pie = plt.subplots()
@@ -546,10 +609,10 @@ if uploaded:
                     csv = portfolio[cols_order].to_csv(index=False).encode('utf-8')
                     st.download_button("Scarica Portafoglio (CSV)", data=csv, file_name="portafoglio_ottimizzato.csv")
 
-                    # --- CORREZIONE 3: Grafici di confronto basati sui pesi effettivi ---
+                    # CORREZIONE 3: Grafici confronto basati su pesi effettivi
                     if any([w_val, w_iss, w_sec, w_mat]):
                         st.header("Confronto Target Vincoli vs Pesi Effettivi Portafoglio")
-                        
+
                         compute_weight_dist = lambda df_port, col: df_port.groupby(col)['Peso (%)'].sum() if col in df_port and 'Peso (%)' in df_port else pd.Series()
 
                         distr_weights = {"Valuta": (w_val, compute_weight_dist(portfolio, "Valuta")),
@@ -562,29 +625,28 @@ if uploaded:
 
                             crit_ui = crit_std
                             if crit_std == "TipoEmittente": crit_ui = "Tipo Emittente"
-                            
+
                             st.subheader(f"Distribuzione Pesi per {crit_ui}")
 
-                            # Assicurati che actual_weight_perc sia una Series per l'indice
                             if not isinstance(actual_weight_perc, pd.Series):
-                                 actual_weight_perc = pd.Series() # Crea Series vuota se il calcolo fallisce
+                                 actual_weight_perc = pd.Series(dtype=float) # Usa dtype=float
 
                             cats = sorted(set(list(target_num_perc.keys())) | set(actual_weight_perc.index.astype(str)))
                             rows = []
                             for c in cats:
                                 rows.append({
                                     crit_ui: c,
-                                    "Target (Input) %": target_num_perc.get(c, 0.0), # Target basato su input N titoli
-                                    "Effettivo (Capitale) %": float(actual_weight_perc.get(c, 0.0)) # Peso effettivo in capitale
+                                    "Target (Input) %": target_num_perc.get(c, 0.0),
+                                    "Effettivo (Capitale) %": float(actual_weight_perc.get(c, 0.0))
                                 })
                             df_table = pd.DataFrame(rows).round(1)
-                            st.dataframe(df_table.set_index(crit_ui)) # Usa la categoria come indice per chiarezza
+                            st.dataframe(df_table.set_index(crit_ui))
 
                             fig_bar, ax_bar = plt.subplots()
                             x = np.arange(len(cats))
                             width = 0.35
                             ax_bar.bar(x - width/2, df_table["Effettivo (Capitale) %"], width, label="Effettivo (Capitale %)")
-                            ax_bar.bar(x + width/2, df_table["Target (Input) %"], width, label="Target (Input %)") # Etichetta chiara
+                            ax_bar.bar(x + width/2, df_table["Target (Input) %"], width, label="Target (Input %)")
                             ax_bar.set_ylabel("Percentuale (%)")
                             ax_bar.set_title(f'Confronto Pesi per {crit_ui}')
                             ax_bar.set_xticks(x)
@@ -592,7 +654,6 @@ if uploaded:
                             ax_bar.legend()
                             plt.tight_layout()
                             st.pyplot(fig_bar)
-                    # --- FINE CORREZIONE 3 ---
 
 
                     st.balloons()
@@ -600,23 +661,20 @@ if uploaded:
                 except (ValueError, RuntimeError) as e:
                     st.error(f"Impossibile costruire il portafoglio: {e}")
                 except Exception as e:
-                    # Stampa traceback completo per debug
-                    st.error(f"Si è verificato un errore inatteso durante l'esecuzione:")
-                    st.exception(e)
-
+                    st.error(f"Errore inatteso:")
+                    st.exception(e) # Mostra traceback completo per debug
 
     except Exception as e:
         exc_type, exc_obj, exc_tb = sys.exc_info()
         line_num = exc_tb.tb_lineno if exc_tb else 'N/A'
         tb_details = traceback.format_exception(exc_type, exc_obj, exc_tb)
-        
+
         error_message = (
-            f"**Si è verificato un errore nel caricamento o nella normalizzazione del file:**\n\n"
-            f"**Tipo di errore:** `{exc_type.__name__}`\n"
+            f"**Errore nel caricamento/normalizzazione:**\n\n"
+            f"**Tipo:** `{exc_type.__name__}`\n"
             f"**Messaggio:** `{str(e)}`\n"
-            f"**Punto critico nel codice (approssimativo):** Riga `{line_num}`\n\n"
-            f"**Stack Trace (dettagli tecnici):**\n```\n{''.join(tb_details)}\n```\n\n"
-            "**Causa probabile:** Potrebbe esserci un'incongruenza nel formato del file (caratteri speciali, separatori non corretti, BOM imprevisto) "
-            "o un problema nella mappatura dei nomi delle colonne. Controlla il messaggio di errore specifico (`ValueError` conterrà dettagli sulle colonne) per identificare il problema."
+            f"**Riga:** `{line_num}`\n\n"
+            f"**Traceback:**\n```\n{''.join(tb_details)}\n```\n\n"
+            "**Verifica il formato del file e la mappatura colonne.**"
         )
         st.error(error_message)
