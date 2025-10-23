@@ -110,16 +110,37 @@ def _map_sector(s: str) -> str:
     if 'gov' in s_lower: return "Govt";
     if any(keyword in s_lower for keyword in financial_keywords): return "Financials"; return "Non Financials"
 def integer_targets_from_weights(n: int, weights: Dict[str, float]) -> Dict[str, int]:
-    if not weights or n<=0: return {}; total_weight=sum(weights.values()); # CORREZIONE UnboundLocalError
-    if total_weight<=0: st.warning(f"Somma pesi target <= 0 ({total_weight}). Impossibile calcolare conteggi."); return {} # CORREZIONE UnboundLocalError
-    normalized_weights={k: v/total_weight for k,v in weights.items()} # CORREZIONE UnboundLocalError
-    raw_counts={k: n*w for k,w in normalized_weights.items()}; floor_counts={k: int(v) for k,v in raw_counts.items()}
-    remainders={k: raw_counts[k]-floor_counts[k] for k in raw_counts}; sorted_remainders=sorted(remainders.items(),key=lambda item:item[1],reverse=True)
-    remaining_n=max(0, n-sum(floor_counts.values()));
+    if not weights or n <= 0:
+        return {}
+        
+    total = sum(weights.values())
+    
+    # --- CORREZIONE: Separare il check dall'assegnazione ---
+    if total <= 0:
+        return {} # Ritorna dizionario vuoto se la somma è zero o negativa
+        
+    # Ora che sappiamo che total > 0, possiamo calcolare normalized_weights
+    normalized_weights = {k: v / total for k, v in weights.items()}
+    # --- FINE CORREZIONE ---
+    
+    raw_counts = {k: n * w for k, w in normalized_weights.items()}
+    floor_counts = {k: int(v) for k, v in raw_counts.items()}
+    remainders = {k: raw_counts[k] - floor_counts[k] for k in raw_counts}
+    
+    sorted_remainders = sorted(remainders.items(), key=lambda item: item[1], reverse=True)
+    
+    remaining_n = n - sum(floor_counts.values())
+    # Assicura che remaining_n non sia negativo
+    remaining_n = max(0, remaining_n)
+    
     for i in range(remaining_n):
-        if not sorted_remainders: break; key_to_increment=sorted_remainders[i % len(sorted_remainders)][0]; floor_counts[key_to_increment]+=1
-    #if sum(floor_counts.values()) != n: st.warning(f"Errore interno conteggi: {sum(floor_counts.values())} != {n}") # Check opzionale
+        # Evita IndexError se sorted_remainders è vuoto (non dovrebbe succedere se n > 0)
+        if not sorted_remainders: break
+        key_to_increment = sorted_remainders[i % len(sorted_remainders)][0]
+        floor_counts[key_to_increment] += 1
+        
     return floor_counts
+
 def _solve_and_get_status(prob, solver):
     try: prob.solve(solver); return prob.status
     except Exception as e: raise RuntimeError(f"Errore risolutore MILP: {e}")
@@ -460,3 +481,4 @@ if uploaded:
         line_num = exc_tb.tb_lineno if exc_tb else 'N/A'; tb_details = traceback.format_exception(exc_type, exc_obj, exc_tb)
         error_message = (f"**Errore caricamento/normalizzazione:**\n\n**Tipo:** `{exc_type.__name__}`\n**Messaggio:** `{str(e)}`\n**Riga:** `{line_num}`\n\n**Traceback:**\n```\n{''.join(tb_details)}\n```\n\n**Verifica formato file e mappatura.**")
         st.error(error_message)
+
