@@ -54,24 +54,25 @@ def _read_data(uploaded) -> pd.DataFrame:
     raise ValueError("Impossibile leggere il file. Prova a salvarlo nuovamente in formato UTF-8.")
 
 def clean_col_name(col_name: str) -> str:
-    """ Pulisce il nome di una colonna rimuovendo caratteri non alfanumerici e convertendo in minuscolo."""
+    """ Pulisce il nome di una colonna per il matching."""
     if not isinstance(col_name, str):
         return ""
-    # Rimuove spazi iniziali/finali, converte in minuscolo, rimuove caratteri non alfanumerici
-    cleaned = re.sub(r'[^a-z0-9]+', '', col_name.strip().lower())
+    # Rimuove spazi iniziali/finali, converte in minuscolo
+    cleaned = col_name.strip().lower()
+    # Opzionale: rimuovere caratteri non alfanumerici se necessario, ma partiamo più leggeri
+    # cleaned = re.sub(r'[^a-z0-9]+', '', cleaned)
     return cleaned
 
 def load_and_normalize(uploaded) -> pd.DataFrame:
     df = _read_data(uploaded)
-    original_columns = list(df.columns)
+    original_columns = list(df.columns) # Per diagnostica
 
-    # Rimuove righe/colonne vuote
     df.dropna(how='all', inplace=True)
     df.dropna(how='all', axis=1, inplace=True)
 
     # Rimuove header duplicato (controllando nome colonna pulito)
     df_columns_cleaned_for_check = {clean_col_name(col): col for col in df.columns}
-    isin_cleaned = 'isin'
+    isin_cleaned = 'isin' # clean_col_name('ISIN')
     if isin_cleaned in df_columns_cleaned_for_check and len(df) > 0:
         original_isin_col_name = df_columns_cleaned_for_check[isin_cleaned]
         if isinstance(df.iloc[0][original_isin_col_name], str) and df.iloc[0][original_isin_col_name].strip().upper() == 'ISIN':
@@ -86,51 +87,59 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
 
     # Crea dizionario di rinomina (originale -> standard) con controllo conflitti
     rename_dict = {}
-    standard_name_assignments = {} # Tiene traccia di quale colonna originale è stata mappata a quale nome standard
-    cleaned_original_cols = {} # Mappa nome pulito -> nome originale
-    
+    standard_name_assignments = {} # standard -> originale
+    column_mapping_details = {} # originale -> pulito -> standard (per diagnostica)
+
     for original_col in df.columns:
         cleaned_col = clean_col_name(original_col)
-        cleaned_original_cols[cleaned_col] = original_col # Salva la corrispondenza
-        
-        if cleaned_col in alias_to_standard_map:
-            target_standard_name = alias_to_standard_map[cleaned_col]
-            
+        target_standard_name = alias_to_standard_map.get(cleaned_col)
+        column_mapping_details[original_col] = {'cleaned': cleaned_col, 'target': target_standard_name}
+
+        if target_standard_name:
             # Controllo conflitti: questo nome standard è già stato assegnato a un'altra colonna?
             if target_standard_name in standard_name_assignments and standard_name_assignments[target_standard_name] != original_col:
                  raise ValueError(
                      f"**ERRORE: Conflitto nella mappatura delle colonne!**\n\n"
                      f"Sia la colonna originale '{standard_name_assignments[target_standard_name]}' che la colonna '{original_col}' "
+                     f"(pulite rispettivamente come '{clean_col_name(standard_name_assignments[target_standard_name])}' e '{cleaned_col}') "
                      f"corrispondono entrambe al nome standard richiesto '{target_standard_name}'.\n"
                      f"Verifica le intestazioni nel tuo file per eliminare duplicati o alias ambigui."
                  )
-            
-            # Se non c'è conflitto o è la stessa colonna che mappa di nuovo (improbabile ma sicuro), assegna
-            if target_standard_name not in standard_name_assignments.values():
+
+            # Se non c'è conflitto o è la stessa colonna, assegna (se non già fatto)
+            if target_standard_name not in rename_dict.values():
                  rename_dict[original_col] = target_standard_name
-                 standard_name_assignments[target_standard_name] = original_col # Registra l'assegnazione
+                 standard_name_assignments[target_standard_name] = original_col
 
-    df_renamed = df.rename(columns=rename_dict)
-    renamed_columns = list(df_renamed.columns)
+    # Applica la rinomina
+    try:
+        df_renamed = df.rename(columns=rename_dict)
+        renamed_columns = list(df_renamed.columns)
+    except Exception as e:
+        raise RuntimeError(f"Errore durante l'applicazione della rinomina delle colonne: {e}")
 
-    # Controllo finale colonne mancanti con diagnostica dettagliata
+
+    # --- CONTROLLO ESPLICITO DOPO LA RINOMINA ---
     required = ["ISIN", "Issuer", "Maturity", "Currency", "ExchangeName", "ScoreRendimento", "ScoreRischio",
                 "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]
-    missing_cols = [c for c in required if c not in df_renamed.columns]
-    if missing_cols:
-        # Crea una mappa di diagnostica: nome pulito originale -> nome originale
-        diagnostic_cleaned_cols = {clean_col_name(orig): orig for orig in original_columns}
+    current_columns_set = set(df_renamed.columns)
+    missing_after_rename = [c for c in required if c not in current_columns_set]
+
+    if missing_after_rename:
         raise ValueError(
-            f"**ERRORE: Colonne obbligatorie mancanti dopo il tentativo di mappatura.**\n\n"
+            f"**ERRORE CRITICO: Colonne mancanti DOPO il tentativo di rinomina.**\n\n"
             f"**Colonne originali lette:**\n`{original_columns}`\n\n"
-            f"**Nomi colonne puliti (usati per mappatura):**\n`{diagnostic_cleaned_cols}`\n\n"
-            f"**Mappatura applicata (Originale -> Standard):**\n`{rename_dict}`\n\n"
+            f"**Dettagli mappatura (Originale -> Pulito -> Target Standard):**\n`{column_mapping_details}`\n\n"
+            f"**Mappatura effettivamente applicata (Originale -> Standard):**\n`{rename_dict}`\n\n"
             f"**Colonne risultanti dopo rinomina:**\n`{renamed_columns}`\n\n"
-            f"**Colonne richieste ma non trovate:**\n`{', '.join(missing_cols)}`\n\n"
-            f"**Verifica la mappatura e i nomi nel tuo file.** L'errore indica che una o più colonne richieste non sono state trovate o mappate correttamente."
+            f"**Colonne richieste ma ancora mancanti:**\n`{', '.join(missing_after_rename)}`\n\n"
+            f"**Controlla la mappatura e i nomi nel file originale. L'errore indica che la colonna '{missing_after_rename[0]}' non è stata trovata o mappata correttamente.**"
         )
+    # --- FINE CONTROLLO ESPLICITO ---
 
     df = df_renamed # Prosegui con il dataframe rinominato
+
+    # --- Conversione Tipi e Calcoli Successivi ---
     df["Maturity"] = pd.to_datetime(df["Maturity"], errors="coerce", dayfirst=True)
     for col in ["ScoreRendimento", "ScoreRischio", "MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement"]:
         try:
@@ -152,11 +161,15 @@ def load_and_normalize(uploaded) -> pd.DataFrame:
         if c in df.columns: df[c] = df[c].fillna("Unknown").astype(str)
 
     critical_numeric_cols = ["MarketPrice", "AccruedInterest", "DenominationMinimum", "DenominationIncrement", "ScoreRendimento", "ScoreRischio"]
-    if df[critical_numeric_cols].isnull().any().any():
-         st.warning("Attenzione: Alcune colonne numeriche essenziali contengono valori mancanti o non validi dopo la conversione. Le righe con valori mancanti verranno escluse.")
+    rows_with_nulls = df[critical_numeric_cols].isnull().any(axis=1)
+    if rows_with_nulls.any():
+         st.warning(f"Attenzione: {rows_with_nulls.sum()} righe contengono valori mancanti o non validi in colonne numeriche essenziali e verranno escluse.")
 
+    # Il dropna ora dovrebbe funzionare perché abbiamo verificato la presenza delle colonne
     return df.dropna(subset=required).reset_index(drop=True)
 
+
+# --- Il resto del codice rimane invariato ---
 
 def _infer_issuer_type(comparto: str) -> str:
     s = str(comparto).lower()
@@ -243,15 +256,22 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
 
     if weighting_scheme == 'Risk Weighted':
         total_risk = portfolio['ScoreRischio'].sum()
-        raw_weights = portfolio['ScoreRischio'] / total_risk if total_risk > 0 else 1 / n
+        # Evita divisione per zero se tutti i rischi sono 0
+        raw_weights = portfolio['ScoreRischio'] / total_risk if total_risk > 0 else pd.Series([1/n] * n, index=portfolio.index)
     else: # Equally Weighted
         raw_weights = pd.Series([1/n] * n, index=portfolio.index)
 
-    step = 1 / (4 * n)
+    step = 1 / (4 * n) if n > 0 else 0.01 # Evita divisione per zero se n=0
     rounded_weights = (raw_weights / step).round() * step
-    normalized_weights = rounded_weights / rounded_weights.sum()
-    portfolio['target_weight'] = normalized_weights
+    # Gestisce il caso in cui l'arrotondamento porti a somma zero
+    if rounded_weights.sum() == 0 and n > 0 :
+         normalized_weights = pd.Series([1/n] * n, index=portfolio.index) # Fallback a EW
+    elif rounded_weights.sum() > 0:
+         normalized_weights = rounded_weights / rounded_weights.sum()
+    else: # Caso n=0 o somma pesi arrotondati = 0
+         normalized_weights = pd.Series([0.0] * len(portfolio), index=portfolio.index) # Pesi a zero se n=0
 
+    portfolio['target_weight'] = normalized_weights
     portfolio['target_capital'] = portfolio['target_weight'] * total_capital
 
     portfolio = portfolio.assign(**{"Valore Nominale (€)": 0.0, "Controvalore di Mercato (€)": 0.0})
@@ -259,7 +279,10 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
     capital_allocated = 0
     for idx, row in portfolio.iterrows():
         min_nominal = row['DenominationMinimum']
-        market_value_per_unit = (row['MarketPrice'] + row['AccruedInterest']) / 100
+        # Assicurati che MarketPrice e AccruedInterest siano numerici e non NaN
+        market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 0
+        accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
+        market_value_per_unit = (market_price + accrued) / 100
         min_market_value = min_nominal * market_value_per_unit
 
         portfolio.loc[idx, 'Valore Nominale (€)'] = min_nominal
@@ -268,35 +291,56 @@ def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, 
 
     capital_remaining = total_capital - capital_allocated
     if capital_remaining < 0:
-        raise ValueError(f"Il capitale totale ({total_capital:,.0f}€) è insufficiente per coprire l'investimento minimo in tutti i titoli ({capital_allocated:,.0f}€).")
+        st.warning(f"Il capitale ({total_capital:,.0f}€) potrebbe essere insufficiente per l'investimento minimo ({capital_allocated:,.0f}€). Allocazione basata solo sul minimo.")
+        capital_remaining = 0 # Non possiamo allocare oltre se già in negativo
 
-    while capital_remaining > 0:
-        portfolio['current_capital'] = portfolio['Controvalore di Mercato (€)']
-        portfolio['capital_diff'] = portfolio['target_capital'] - portfolio['current_capital']
+    # Allocazione incrementale solo se c'è capitale rimanente positivo
+    if capital_remaining > 0:
+        # Ordina per differenza di capitale per allocare prima dove manca di più
+        portfolio.sort_values(by='target_capital', ascending=False, inplace=True)
+        
+        for _ in range(n * 100): # Limita il numero di iterazioni per sicurezza
+            portfolio['current_capital'] = portfolio['Controvalore di Mercato (€)']
+            portfolio['capital_diff'] = portfolio['target_capital'] - portfolio['current_capital']
+            
+            # Trova il titolo più sotto-allocato che può ancora ricevere capitale
+            eligible_for_increment = portfolio['capital_diff'] > 0
+            if not eligible_for_increment.any(): break # Nessun titolo necessita più capitale
 
-        if portfolio['capital_diff'].max() <= 0: break
+            most_underfunded_idx = portfolio[eligible_for_increment]['capital_diff'].idxmax()
 
-        most_underfunded_idx = portfolio['capital_diff'].idxmax()
+            row = portfolio.loc[most_underfunded_idx]
+            increment_nominal = row['DenominationIncrement']
+            market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 0
+            accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
+            market_value_per_unit = (market_price + accrued) / 100
+            increment_market_value = increment_nominal * market_value_per_unit
 
-        row = portfolio.loc[most_underfunded_idx]
-        increment_nominal = row['DenominationIncrement']
-        market_value_per_unit = (row['MarketPrice'] + row['AccruedInterest']) / 100
-        increment_market_value = increment_nominal * market_value_per_unit
+            if increment_market_value <= 0: # Evita loop infiniti se l'incremento ha costo zero
+                 portfolio.loc[most_underfunded_idx, 'capital_diff'] = -1 # Escludi questo titolo da future allocazioni
+                 continue
 
-        if capital_remaining >= increment_market_value:
-            portfolio.loc[most_underfunded_idx, 'Valore Nominale (€)'] += increment_nominal
-            portfolio.loc[most_underfunded_idx, 'Controvalore di Mercato (€)'] += increment_market_value
-            capital_remaining -= increment_market_value
-        else:
-            break
+            if capital_remaining >= increment_market_value:
+                portfolio.loc[most_underfunded_idx, 'Valore Nominale (€)'] += increment_nominal
+                portfolio.loc[most_underfunded_idx, 'Controvalore di Mercato (€)'] += increment_market_value
+                capital_remaining -= increment_market_value
+            else:
+                 # Se non basta per questo titolo, prova il successivo più sotto-allocato
+                 portfolio.loc[most_underfunded_idx, 'capital_diff'] = -1 # Marca come non più allocabile
+                 if (portfolio['capital_diff'] > 0).sum() == 0: # Se nessun altro titolo può ricevere, esci
+                      break
 
     total_market_value = portfolio['Controvalore di Mercato (€)'].sum()
     if total_market_value > 0:
         portfolio['Peso (%)'] = (portfolio['Controvalore di Mercato (€)'] / total_market_value) * 100
+    else:
+         portfolio['Peso (%)'] = 0.0
+
 
     return portfolio.drop(columns=['target_weight', 'target_capital', 'current_capital', 'capital_diff'], errors='ignore')
 
 
+# --- Interfaccia Streamlit (invariata dalla versione precedente) ---
 st.set_page_config(page_title="Bond Portfolio Selector", layout="wide")
 st.title("Bond Portfolio Selector — Ottimizzazione con Vincoli")
 
@@ -404,7 +448,9 @@ if uploaded:
 
                     st.subheader("Distribuzione Pesi del Portafoglio")
                     fig_pie, ax_pie = plt.subplots()
-                    ax_pie.pie(portfolio['Peso (%)'], labels=portfolio['ISIN'], autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8})
+                    # Gestisce il caso di pesi a zero per evitare errori nel grafico
+                    plot_weights = portfolio['Peso (%)'] if portfolio['Peso (%)'].sum() > 0 else [1]*len(portfolio) 
+                    ax_pie.pie(plot_weights, labels=portfolio['ISIN'], autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8})
                     ax_pie.axis('equal')
                     st.pyplot(fig_pie)
 
@@ -413,7 +459,7 @@ if uploaded:
 
                     if any([w_val, w_iss, w_sec, w_mat]):
                         st.header("Confronto Target vs Effettivo (per numero titoli)")
-                        compute_dist_count = lambda df_port, col: (df_port[col].value_counts(normalize=True) * 100)
+                        compute_dist_count = lambda df_port, col: (df_port[col].value_counts(normalize=True) * 100) if not df_port.empty else pd.Series()
 
                         distr_count = {"Valuta": (w_val, compute_dist_count(portfolio, "Valuta")), "TipoEmittente": (w_iss, compute_dist_count(portfolio, "TipoEmittente")),
                                     "Settore": (w_sec, compute_dist_count(portfolio, "Settore")), "Scadenza": (w_mat, compute_dist_count(portfolio, "Scadenza"))}
@@ -438,7 +484,6 @@ if uploaded:
         # --- BLOCCO DI ERRORE CON DIAGNOSTICA DETTAGLIATA ---
         exc_type, exc_obj, exc_tb = sys.exc_info()
         line_num = exc_tb.tb_lineno if exc_tb else 'N/A'
-        # Estrae lo stack trace per più contesto
         tb_details = traceback.format_exception(exc_type, exc_obj, exc_tb)
         
         error_message = (
