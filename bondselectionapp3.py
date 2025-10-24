@@ -45,15 +45,11 @@ def get_fx_rate(currency_code: str) -> float:
     return APPROX_FX_RATES.get(str(currency_code).upper(), 1.0)
 
 def _read_data(uploaded) -> pd.DataFrame:
-    file_name = uploaded.name
-    separator = '\t' if file_name.lower().endswith('.txt') else ','
+    file_name = uploaded.name; separator = '\t' if file_name.lower().endswith('.txt') else ','
     encodings = ["utf-8-sig", "utf-8", "ISO-8859-1", "latin1", "cp1252"]
     for enc in encodings:
-        try:
-            uploaded.seek(0)
-            return pd.read_csv(uploaded, sep=separator, encoding=enc, engine='python', skipinitialspace=True)
-        except Exception:
-            continue
+        try: uploaded.seek(0); return pd.read_csv(uploaded, sep=separator, encoding=enc, engine='python', skipinitialspace=True)
+        except Exception: continue
     raise ValueError("Impossibile leggere il file. Prova a salvarlo in UTF-8.")
 
 def clean_col_name(col_name: str) -> str:
@@ -61,14 +57,12 @@ def clean_col_name(col_name: str) -> str:
     return col_name.strip().lower()
 
 def load_and_normalize(uploaded) -> pd.DataFrame:
-    df = _read_data(uploaded)
-    original_columns = list(df.columns)
+    df = _read_data(uploaded); original_columns = list(df.columns)
     df.dropna(how='all', inplace=True); df.dropna(how='all', axis=1, inplace=True)
     df_columns_cleaned_for_check = {clean_col_name(col): col for col in df.columns}
     isin_cleaned = 'isin'
     if isin_cleaned in df_columns_cleaned_for_check and len(df) > 0:
-        original_isin_col_name = df_columns_cleaned_for_check[isin_cleaned]
-        first_isin_val = df.iloc[0][original_isin_col_name]
+        original_isin_col_name = df_columns_cleaned_for_check[isin_cleaned]; first_isin_val = df.iloc[0][original_isin_col_name]
         if isinstance(first_isin_val, str) and first_isin_val.strip().upper() == 'ISIN': df = df.iloc[1:].reset_index(drop=True)
     alias_to_standard_map = {clean_col_name(alias): std for std, aliases in REQUIRED_COLS_ALIASES.items() for alias in aliases}
     rename_dict, standard_name_assignments = {}, {}; column_mapping_details = {}
@@ -116,51 +110,33 @@ def _map_sector(s: str) -> str:
     if 'gov' in s_lower: return "Govt";
     if any(keyword in s_lower for keyword in financial_keywords): return "Financials"; return "Non Financials"
 
-# --- FUNZIONE SOSTITUITA ---
 def integer_targets_from_weights(n: int, weights: Dict[str, float]) -> Dict[str, int]:
+    # Versione fornita dall'utente
     if not weights or n <= 0:
         return {}
-
     total = sum(weights.values())
-
-    # --- CORREZIONE: Separare il check dall'assegnazione ---
     if total <= 0:
-        st.warning(f"Somma dei pesi target è <= 0 ({total}). Impossibile calcolare i conteggi interi.") # Aggiunto warning
-        return {} # Ritorna dizionario vuoto se la somma è zero o negativa
-
-    # Ora che sappiamo che total > 0, possiamo calcolare normalized_weights
+        st.warning(f"Somma pesi target <= 0 ({total}). Impossibile calcolare conteggi.")
+        return {}
     normalized_weights = {k: v / total for k, v in weights.items()}
-    # --- FINE CORREZIONE ---
-
     raw_counts = {k: n * w for k, w in normalized_weights.items()}
     floor_counts = {k: int(v) for k, v in raw_counts.items()}
     remainders = {k: raw_counts[k] - floor_counts[k] for k in raw_counts}
-
     sorted_remainders = sorted(remainders.items(), key=lambda item: item[1], reverse=True)
-
     remaining_n = n - sum(floor_counts.values())
-    # Assicura che remaining_n non sia negativo
     remaining_n = max(0, remaining_n)
-
     for i in range(remaining_n):
-        # Evita IndexError se sorted_remainders è vuoto (non dovrebbe succedere se n > 0)
         if not sorted_remainders: break
         key_to_increment = sorted_remainders[i % len(sorted_remainders)][0]
         floor_counts[key_to_increment] += 1
-
-    # Controllo finale opzionale
-    # if sum(floor_counts.values()) != n:
-    #     st.warning(f"Errore interno conteggi: {sum(floor_counts.values())} != {n}")
-
     return floor_counts
-# --- FINE FUNZIONE SOSTITUITA ---
-
 
 def _solve_and_get_status(prob, solver):
     try: prob.solve(solver); return prob.status
     except Exception as e: raise RuntimeError(f"Errore risolutore MILP: {e}")
 
 def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec, targ_mat, weighting_scheme: str) -> pd.DataFrame:
+    # ... (invariato)
     if pulp is None: raise RuntimeError("PuLP non installato.");
     if n<=0: raise ValueError("N titoli > 0.");
     if df.empty: raise ValueError("Universo vuoto.");
@@ -175,10 +151,7 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
     for col_ui, weights_map in targets.items():
         if not weights_map: continue
         integer_counts=integer_targets_from_weights(n, weights_map)
-        # Aggiungi check se integer_counts è vuoto (es. se total weight era <= 0)
-        if not integer_counts:
-            st.warning(f"Impossibile applicare vincoli per {col_ui} a causa di somma pesi non valida.")
-            continue # Salta questo vincolo
+        if not integer_counts: continue # Salta se i conteggi non sono validi
         for cat, count in integer_counts.items():
             cat_indices=df_copy[df_copy[col_ui]==str(cat)].index.tolist()
             if cat_indices: prob+=pulp.lpSum(x[i] for i in cat_indices)==count, f"Constraint_{col_ui}_{cat}"
@@ -201,75 +174,138 @@ def build_portfolio_milp(df: pd.DataFrame, n: int, targ_val, targ_iss, targ_sec,
 
 
 def calculate_capital_allocation(portfolio: pd.DataFrame, total_capital: float, weighting_scheme: str, n: int) -> pd.DataFrame:
-    # ... (logica allocazione invariata rispetto all'ultima versione)
-    if portfolio.empty or total_capital <= 0 or n <= 0: return portfolio.assign(**{"VN": 0, "CM": 0, "Peso": 0})
+    if portfolio.empty or total_capital <= 0 or n <= 0:
+        return portfolio.assign(**{"Valore Nominale (€)": 0, "Controvalore di Mercato (€)": 0, "Peso (%)": 0})
 
+    # --- CALCOLO PESI TARGET CON CAP ---
+    # CORREZIONE 1: Base EW è 1/n
     if weighting_scheme == 'Risk Weighted':
         total_risk = portfolio['ScoreRischio'].sum()
         raw_weights = portfolio['ScoreRischio'] / total_risk if pd.notna(total_risk) and total_risk > 0 else pd.Series([1/n] * n, index=portfolio.index)
-    else: raw_weights = pd.Series([1/n] * n, index=portfolio.index)
+    else: # Equally Weighted
+        raw_weights = pd.Series([1/n] * n, index=portfolio.index) # Inizia da EW puro
 
-    step = 1 / (4 * n); rounded_weights = (raw_weights / step).round() * step
-    normalized_weights = pd.Series([0.0]*len(portfolio), index=portfolio.index)
-    if rounded_weights.sum() > 0: normalized_weights = rounded_weights / rounded_weights.sum()
-    else: normalized_weights = pd.Series([1/n] * n, index=portfolio.index) # Fallback EW
+    # Arrotondamento rimosso per EW per mantenere 1/n più preciso
+    if weighting_scheme == 'Risk Weighted':
+         step = 1 / (4 * n)
+         rounded_weights = (raw_weights / step).round() * step
+         normalized_weights = pd.Series([0.0]*len(portfolio), index=portfolio.index)
+         if rounded_weights.sum() > 0: normalized_weights = rounded_weights / rounded_weights.sum()
+         else: normalized_weights = pd.Series([1/n] * n, index=portfolio.index) # Fallback EW
+    else: # Equally Weighted
+         normalized_weights = raw_weights # Usa 1/n direttamente
 
-    max_weight_limit = (1 / n) * 2.5; capped_weights = normalized_weights.copy()
-    exceeding_mask = capped_weights > max_weight_limit; total_excess = (capped_weights[exceeding_mask] - max_weight_limit).sum()
-    capped_weights[exceeding_mask] = max_weight_limit; below_cap_mask = ~exceeding_mask; sum_below_cap = capped_weights[below_cap_mask].sum()
-    if total_excess > 0 and sum_below_cap > 0: capped_weights[below_cap_mask] += capped_weights[below_cap_mask] * (total_excess / sum_below_cap); capped_weights = capped_weights / capped_weights.sum()
+
+    max_weight_limit = (1 / n) * 2.5
+    capped_weights = normalized_weights.copy()
+    exceeding_mask = capped_weights > max_weight_limit
+    total_excess = (capped_weights[exceeding_mask] - max_weight_limit).sum()
+    capped_weights[exceeding_mask] = max_weight_limit
+    below_cap_mask = ~exceeding_mask
+    sum_below_cap = capped_weights[below_cap_mask].sum()
+    if total_excess > 0 and sum_below_cap > 0:
+         capped_weights[below_cap_mask] += capped_weights[below_cap_mask] * (total_excess / sum_below_cap)
+         capped_weights = capped_weights / capped_weights.sum()
     elif total_excess > 0: capped_weights = pd.Series([1/n] * n, index=portfolio.index)
-    portfolio['target_weight'] = capped_weights; portfolio['target_capital'] = portfolio['target_weight'] * total_capital
+
+    portfolio['target_weight'] = capped_weights
+    portfolio['target_capital'] = portfolio['target_weight'] * total_capital
     max_capital_per_bond = max_weight_limit * total_capital
+    # ---- FINE CALCOLO PESI TARGET ----
 
     portfolio = portfolio.assign(**{"Valore Nominale (€)": 0.0, "Controvalore di Mercato (€)": 0.0})
-    capital_allocated = 0; min_nominal_floor = 1000
+    capital_allocated = 0
+    min_nominal_floor = 1000 # CORREZIONE 2
 
     min_total_investment = 0
     for idx, row in portfolio.iterrows():
-         min_nominal_data = row['DenominationMinimum'] if pd.notna(row['DenominationMinimum']) else min_nominal_floor; effective_min_nominal = max(min_nominal_floor, min_nominal_data)
-         market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100; accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
-         fx_rate = row.get('FX_Rate_to_EUR', 1.0); market_value_per_unit_local = (market_price + accrued) / 100
+         min_nominal_data = row['DenominationMinimum'] if pd.notna(row['DenominationMinimum']) else min_nominal_floor
+         effective_min_nominal = max(min_nominal_floor, min_nominal_data)
+         market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100
+         accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
+         fx_rate = row.get('FX_Rate_to_EUR', 1.0)
+         market_value_per_unit_local = (market_price + accrued) / 100
          min_total_investment += effective_min_nominal * market_value_per_unit_local * fx_rate
-    if min_total_investment > total_capital: raise ValueError(f"Capitale ({total_capital:,.0f}€) insuff. per inv. minimo ({min_total_investment:,.0f}€).")
+    if min_total_investment > total_capital:
+         raise ValueError(f"Capitale ({total_capital:,.0f}€) insufficiente per investimento minimo ({min_total_investment:,.0f}€).")
 
     for idx, row in portfolio.iterrows():
-        min_nominal_data = row['DenominationMinimum'] if pd.notna(row['DenominationMinimum']) else min_nominal_floor; effective_min_nominal = max(min_nominal_floor, min_nominal_data)
-        market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100; accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
-        fx_rate = row.get('FX_Rate_to_EUR', 1.0); market_value_per_unit_local = (market_price + accrued) / 100
+        min_nominal_data = row['DenominationMinimum'] if pd.notna(row['DenominationMinimum']) else min_nominal_floor
+        effective_min_nominal = max(min_nominal_floor, min_nominal_data)
+        market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100
+        accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
+        fx_rate = row.get('FX_Rate_to_EUR', 1.0)
+        market_value_per_unit_local = (market_price + accrued) / 100
         min_market_value_eur = effective_min_nominal * market_value_per_unit_local * fx_rate
-        portfolio.loc[idx, 'Valore Nominale (€)'] = effective_min_nominal; portfolio.loc[idx, 'Controvalore di Mercato (€)'] = min_market_value_eur; capital_allocated += min_market_value_eur
+        portfolio.loc[idx, 'Valore Nominale (€)'] = effective_min_nominal
+        portfolio.loc[idx, 'Controvalore di Mercato (€)'] = min_market_value_eur
+        capital_allocated += min_market_value_eur
+
     capital_remaining = max(0, total_capital - capital_allocated)
 
+    # Allocazione incrementale MIGLIORATA per EW
     if capital_remaining > 0:
         portfolio['capital_diff_abs'] = np.maximum(0, portfolio['target_capital'] - portfolio['Controvalore di Mercato (€)'])
         can_allocate_more = True; max_iterations = len(portfolio) * 100; iteration = 0
+
         while capital_remaining >= 1 and can_allocate_more and iteration < max_iterations:
             iteration += 1; allocated_in_iteration = False
-            portfolio.sort_values(by='capital_diff_abs', ascending=False, inplace=True); indices_to_iterate = portfolio.index.tolist()
+            # Ordina per chi è più lontano dal target capital
+            portfolio.sort_values(by='capital_diff_abs', ascending=False, inplace=True)
+            indices_to_iterate = portfolio.index.tolist()
+
             for idx in indices_to_iterate:
-                 if capital_remaining < 1: break; row = portfolio.loc[idx]
+                 if capital_remaining < 1: break
+                 row = portfolio.loc[idx]
                  increment_nominal_data = row['DenominationIncrement'] if pd.notna(row['DenominationIncrement']) and row['DenominationIncrement'] > 0 else 1000
-                 effective_increment_nominal = max(100, increment_nominal_data)
-                 market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100; accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
+                 effective_increment_nominal = max(100, increment_nominal_data) # CORREZIONE 1 (utente precedente)
+
+                 market_price = row['MarketPrice'] if pd.notna(row['MarketPrice']) else 100
+                 accrued = row['AccruedInterest'] if pd.notna(row['AccruedInterest']) else 0
                  fx_rate = row.get('FX_Rate_to_EUR', 1.0); market_value_per_unit_local = (market_price + accrued) / 100
                  increment_market_value_eur = effective_increment_nominal * market_value_per_unit_local * fx_rate
+
                  if increment_market_value_eur <= 0: continue
-                 current_capital_pos = portfolio.loc[idx, 'Controvalore di Mercato (€)']; potential_capital_pos = current_capital_pos + increment_market_value_eur
-                 can_afford = capital_remaining >= increment_market_value_eur; within_max_cap = potential_capital_pos <= max_capital_per_bond
-                 should_allocate = can_afford and within_max_cap
+
+                 current_capital_pos = portfolio.loc[idx, 'Controvalore di Mercato (€)']
+                 potential_capital_pos = current_capital_pos + increment_market_value_eur
+
+                 can_afford = capital_remaining >= increment_market_value_eur
+                 within_max_cap = potential_capital_pos <= max_capital_per_bond
+
+                 # CORREZIONE 1: Logica allocazione EW vs RW
+                 should_allocate = False
+                 if can_afford and within_max_cap:
+                      # Per EW, alloca sempre se possibile e sotto cap
+                      # Per RW, alloca solo se sotto target E sotto cap
+                      if weighting_scheme == 'Equally Weighted':
+                           should_allocate = True
+                      else: # Risk Weighted
+                           # Opzione 1: Fermati esattamente al target
+                           # should_allocate = potential_capital_pos <= portfolio.loc[idx, 'target_capital']
+                           # Opzione 2: Permetti di superare leggermente il target se serve a usare capitale
+                           #           (ma rimani sotto il max_cap) - questa è la logica attuale
+                           should_allocate = True # Già controllato within_max_cap
+
                  if should_allocate:
-                      portfolio.loc[idx, 'Valore Nominale (€)'] += effective_increment_nominal; portfolio.loc[idx, 'Controvalore di Mercato (€)'] += increment_market_value_eur
-                      capital_remaining -= increment_market_value_eur; allocated_in_iteration = True
+                      portfolio.loc[idx, 'Valore Nominale (€)'] += effective_increment_nominal
+                      portfolio.loc[idx, 'Controvalore di Mercato (€)'] += increment_market_value_eur
+                      capital_remaining -= increment_market_value_eur
+                      allocated_in_iteration = True
                       portfolio.loc[idx, 'capital_diff_abs'] = np.maximum(0, portfolio.loc[idx, 'target_capital'] - portfolio.loc[idx, 'Controvalore di Mercato (€)'])
-            if not allocated_in_iteration: can_allocate_more = False
+
+            if not allocated_in_iteration:
+                 can_allocate_more = False
 
     total_market_value = portfolio['Controvalore di Mercato (€)'].sum()
-    portfolio['Peso (%)'] = (portfolio['Controvalore di Mercato (€)'] / total_market_value) * 100 if total_market_value > 0 else 0.0
+    if total_market_value > 0:
+        portfolio['Peso (%)'] = (portfolio['Controvalore di Mercato (€)'] / total_market_value) * 100
+    else: portfolio['Peso (%)'] = 0.0
+
     return portfolio.drop(columns=['target_weight', 'target_capital', 'capital_diff_abs'], errors='ignore')
 
 
-# --- Interfaccia Streamlit (con correzioni UI) ---
+# --- Interfaccia Streamlit ---
 st.set_page_config(page_title="Bond Selector", layout="wide")
 st.title("Bond Portfolio Selector — Ottimizzazione")
 
@@ -302,6 +338,7 @@ if uploaded:
             else: st.error("'ExchangeName' mancante."); universe_filtered_market = pd.DataFrame()
         else: universe_filtered_market = base_universe.copy()
 
+        # ---- FILTRO LOTTI MINIMI ECCESSIVI (1.5x EW) ----
         universe = universe_filtered_market.copy(); n_for_filter = n; excluded_isin_list = []
         if n_for_filter > 0 and total_capital > 0 and not universe.empty:
              max_weight_limit_filter = (1 / n_for_filter) * 1.5; max_capital_per_bond_filter = max_weight_limit_filter * total_capital
@@ -311,10 +348,13 @@ if uploaded:
              oversized_lots_mask = universe['min_investment_cost_eur_filter'] > max_capital_per_bond_filter
              if oversized_lots_mask.any():
                   n_excluded = oversized_lots_mask.sum(); excluded_isin_list = universe.loc[oversized_lots_mask, 'ISIN'].tolist()
+                  # CORREZIONE 3: Messaggio dinamico
                   st.warning(f"{n_excluded} titoli esclusi: costo lotto min > {max_weight_limit_filter*100:.1f}% capitale.")
                   universe = universe[~oversized_lots_mask].copy()
              universe.drop(columns=['effective_min_nominal_filter', 'min_investment_cost_eur_filter'], errors='ignore', inplace=True)
-        st.info(f"Universo investibile (dopo filtri): {len(universe)} titoli.")
+        # ---- FINE FILTRO ----
+
+        st.info(f"Universo investibile (dopo filtri): {len(universe)} titoli.") # CORREZIONE 4
 
         w_val, w_iss, w_sec, w_mat = {}, {}, {}, {}
         def get_weights_from_user_ui(title, col_name_ui, df_source, universe_current, key_prefix):
@@ -357,14 +397,17 @@ if uploaded:
 
                     portfolio_display = portfolio.copy()
                     portfolio_display.index = np.arange(1, len(portfolio_display) + 1) # CORREZIONE 1
+
                     cols_order = ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)'] + [c for c in portfolio.columns if c not in ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)', 'FX_Rate_to_EUR']]
                     portfolio_display = portfolio_display[cols_order]
+
                     # CORREZIONE 2: Applica fillna(0) PRIMA di map
                     for col in ['Valore Nominale (€)', 'Controvalore di Mercato (€)']:
-                        if col in portfolio.columns: portfolio_display[col] = pd.to_numeric(portfolio[col], errors='coerce').fillna(0).map('{:,.0f}'.format)
-                        else: portfolio_display[col] = '0'
+                         if col in portfolio.columns: portfolio_display[col] = pd.to_numeric(portfolio[col], errors='coerce').fillna(0).map('{:,.0f}'.format)
+                         else: portfolio_display[col] = '0' # Default a '0'
                     if 'Peso (%)' in portfolio.columns: portfolio_display['Peso (%)'] = pd.to_numeric(portfolio['Peso (%)'], errors='coerce').fillna(0).map('{:.2f}%'.format)
-                    else: portfolio_display['Peso (%)'] = '0.00%'
+                    else: portfolio_display['Peso (%)'] = '0.00%' # Default
+
 
                     st.dataframe(portfolio_display)
 
@@ -402,9 +445,10 @@ if uploaded:
 
                     # CSV Download
                     cols_order_csv = ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)'] + [c for c in portfolio.columns if c not in ['Peso (%)', 'Valore Nominale (€)', 'Controvalore di Mercato (€)', 'FX_Rate_to_EUR']]
-                    csv_df = portfolio[cols_order_csv].copy()
-                    csv_df['Peso (%)'] = csv_df['Peso (%)'].round(4)
-                    csv_df['Controvalore di Mercato (€)'] = csv_df['Controvalore di Mercato (€)'].round(2)
+                    csv_df = portfolio[cols_order_csv].copy() # Usa df originale
+                    # Applica arrotondamenti per CSV su df originale
+                    csv_df['Peso (%)'] = portfolio['Peso (%)'].round(4)
+                    csv_df['Controvalore di Mercato (€)'] = portfolio['Controvalore di Mercato (€)'].round(2)
                     csv = csv_df.to_csv(index=False).encode('utf-8')
                     st.download_button("Scarica Portafoglio (CSV)", data=csv, file_name="portafoglio_ottimizzato.csv")
 
